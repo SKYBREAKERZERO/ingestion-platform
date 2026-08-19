@@ -5,7 +5,15 @@ import sys
 import traceback
 from pathlib import Path
 
-from app.pipeline.pipeline_factory import PipelineFactory
+from app.config.config_loader import (
+    AppConfig,
+    ConfigLoader,
+    ConfigurationError,
+)
+
+from app.pipeline.pipeline_factory import (
+    PipelineFactory,
+)
 
 
 LOGGER = logging.getLogger(
@@ -25,24 +33,15 @@ IS_FROZEN = bool(
     )
 )
 
-SAVE_JSON = True
-
-# Python 开发环境：
-#     写入 PostgreSQL
-#
-# PyInstaller EXE：
-#     不连接 PostgreSQL
-SAVE_DATABASE = not IS_FROZEN
-
 
 def get_application_directory() -> Path:
     """
     获取应用程序运行目录。
 
-    开发环境：
+    Python 开发环境：
         返回项目根目录。
 
-    PyInstaller 环境：
+    PyInstaller EXE：
         返回 EXE 所在目录。
     """
 
@@ -56,27 +55,92 @@ def get_application_directory() -> Path:
     ).resolve().parents[1]
 
 
-BASE_DIR = get_application_directory()
+BASE_DIR = (
+    get_application_directory()
+)
+
+
+def load_application_config() -> AppConfig:
+    """
+    加载应用配置。
+
+    默认位置：
+
+        Python:
+            <project>/config/config.yaml
+
+        EXE:
+            <exe>/config/config.yaml
+
+    Returns:
+        AppConfig
+
+    Raises:
+        ConfigurationError:
+            配置文件不存在、格式错误或校验失败。
+    """
+
+    try:
+        return ConfigLoader.load()
+
+    except ConfigurationError:
+        raise
+
+    except Exception as exc:
+        raise ConfigurationError(
+            "Unexpected configuration loading error: "
+            f"{exc}"
+        ) from exc
+
+
+CONFIG = load_application_config()
+
+
+# =====================
+# Runtime Paths
+# =====================
 
 INPUT_DIR = (
     BASE_DIR
-    / "input"
-)
+    / CONFIG.runtime.input_directory
+).resolve()
 
 OUTPUT_DIR = (
     BASE_DIR
-    / "output"
-)
+    / CONFIG.runtime.output_directory
+).resolve()
 
 LOG_DIR = (
     BASE_DIR
-    / "logs"
+    / CONFIG.runtime.log_directory
+).resolve()
+
+
+# =====================
+# Runtime Options
+# =====================
+
+SAVE_JSON = (
+    CONFIG.output.save_json
+)
+
+SAVE_DATABASE = (
+    CONFIG.database.enabled
+)
+
+CHUNK_MAX_LENGTH = (
+    CONFIG.chunk.max_length
 )
 
 
 def configure_logging() -> None:
     """
-    初始化控制台和文件日志。
+    初始化日志系统。
+
+    日志配置从 config.yaml 获取：
+
+        logging.level
+        logging.file_name
     """
 
     LOG_DIR.mkdir(
@@ -86,11 +150,17 @@ def configure_logging() -> None:
 
     log_file = (
         LOG_DIR
-        / "application.log"
+        / CONFIG.logging.file_name
+    )
+
+    log_level = getattr(
+        logging,
+        CONFIG.logging.level,
+        logging.INFO,
     )
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format=(
             "%(asctime)s | "
             "%(levelname)s | "
@@ -113,6 +183,8 @@ def configure_logging() -> None:
 def ensure_directories() -> None:
     """
     创建运行所需目录。
+
+    不依赖目录预先存在。
     """
 
     for directory in (
@@ -128,32 +200,34 @@ def ensure_directories() -> None:
 
 def discover_input_files() -> list[Path]:
     """
-    获取 input 目录下所有受支持的文档。
+    获取 input 目录下所有受支持文档。
 
     排序规则：
         1. 扩展名
         2. 文件名
 
-    忽略：
+    自动忽略：
         - Office 临时文件
-        - 不受支持的扩展名
-        - 目录
+        - 未支持格式
+        - 文件夹
     """
 
-    return sorted(
-        (
-            file
-            for file in INPUT_DIR.iterdir()
-            if (
-                file.is_file()
-                and not file.name.startswith(
-                    "~$"
-                )
-                and PipelineFactory.supports(
-                    file
-                )
+    files = [
+        file
+        for file in INPUT_DIR.iterdir()
+        if (
+            file.is_file()
+            and not file.name.startswith(
+                "~$"
             )
-        ),
+            and PipelineFactory.supports(
+                file
+            )
+        )
+    ]
+
+    return sorted(
+        files,
         key=lambda file: (
             file.suffix.lower(),
             file.name.lower(),
@@ -161,22 +235,40 @@ def discover_input_files() -> list[Path]:
     )
 
 
+def build_pipeline_kwargs() -> dict:
+    """
+    构建统一 Pipeline 初始化参数。
+
+    当前所有 Pipeline 共用：
+
+        save_json
+        save_database
+        chunk_max_length
+    """
+
+    return {
+        "save_json": SAVE_JSON,
+        "save_database": SAVE_DATABASE,
+        "chunk_max_length": CHUNK_MAX_LENGTH,
+    }
+
+
 def process_file(
     file_path: Path,
 ) -> bool:
     """
-    处理单个文件。
+    处理单个文档。
 
     Args:
         file_path:
-            输入文件路径。
+            输入文档路径。
 
     Returns:
         True:
-            处理成功。
+            成功。
 
         False:
-            处理失败。
+            失败。
     """
 
     output_path = (
@@ -192,15 +284,16 @@ def process_file(
     print("====================")
 
     LOGGER.info(
-        "Processing started: %s",
+        "Processing started | file=%s",
         file_path,
     )
 
     try:
-        pipeline = PipelineFactory.create(
-            file_path,
-            save_json=SAVE_JSON,
-            save_database=SAVE_DATABASE,
+        pipeline = (
+            PipelineFactory.create(
+                file_path,
+                **build_pipeline_kwargs(),
+            )
         )
 
         pipeline_name = (
@@ -230,19 +323,23 @@ def process_file(
             ),
         )
 
-        LOGGER.info(
-            "Selected pipeline: %s",
-            pipeline_name,
+        print(
+            "Chunk max length:",
+            CHUNK_MAX_LENGTH,
         )
 
         LOGGER.info(
-            (
-                "Pipeline options | "
-                "save_json=%s | "
-                "save_database=%s"
-            ),
+            "Pipeline selected | "
+            "file=%s | "
+            "pipeline=%s | "
+            "save_json=%s | "
+            "save_database=%s | "
+            "chunk_max_length=%s",
+            file_path.name,
+            pipeline_name,
             SAVE_JSON,
             SAVE_DATABASE,
+            CHUNK_MAX_LENGTH,
         )
 
         document = pipeline.run(
@@ -251,18 +348,22 @@ def process_file(
         )
 
         print("Completed")
+
         print(
             "Pages:",
             len(document.pages),
         )
+
         print(
             "Chapters:",
             len(document.chapters),
         )
+
         print(
             "Sections:",
             len(document.sections),
         )
+
         print(
             "Contents:",
             len(document.contents),
@@ -281,18 +382,16 @@ def process_file(
             )
 
         LOGGER.info(
-            (
-                "Processing completed | "
-                "file=%s | "
-                "pipeline=%s | "
-                "pages=%s | "
-                "chapters=%s | "
-                "sections=%s | "
-                "contents=%s | "
-                "save_json=%s | "
-                "save_database=%s | "
-                "output=%s"
-            ),
+            "Processing completed | "
+            "file=%s | "
+            "pipeline=%s | "
+            "pages=%s | "
+            "chapters=%s | "
+            "sections=%s | "
+            "contents=%s | "
+            "save_json=%s | "
+            "save_database=%s | "
+            "output=%s",
             file_path.name,
             pipeline_name,
             len(document.pages),
@@ -314,20 +413,14 @@ def process_file(
         print(exc)
 
         LOGGER.error(
-            (
-                "Processing failed | "
-                "file=%s | "
-                "save_json=%s | "
-                "save_database=%s | "
-                "error=%s"
-            ),
+            "Processing failed | "
+            "file=%s | "
+            "error=%s",
             file_path.name,
-            SAVE_JSON,
-            SAVE_DATABASE,
             exc,
         )
 
-        LOGGER.error(
+        LOGGER.debug(
             traceback.format_exc()
         )
 
@@ -336,7 +429,10 @@ def process_file(
 
 def print_runtime_information() -> None:
     """
-    输出当前运行模式和目录信息。
+    输出当前运行环境与应用配置。
+
+    注意：
+        不打印数据库密码。
     """
 
     runtime_mode = (
@@ -345,47 +441,102 @@ def print_runtime_information() -> None:
         else "Python"
     )
 
-    database_status = (
-        "Enabled"
-        if SAVE_DATABASE
-        else "Disabled"
+    print()
+    print(
+        "========================================"
+    )
+    print(
+        CONFIG.application.name
+    )
+    print(
+        "========================================"
     )
 
-    print()
-    print("========================================")
-    print("Document Ingestion Platform")
-    print("========================================")
     print(
         "Runtime:",
         runtime_mode,
     )
+
+    print(
+        "Environment:",
+        CONFIG.application.environment,
+    )
+
     print(
         "Base directory:",
         BASE_DIR,
     )
+
     print(
         "Input directory:",
         INPUT_DIR,
     )
+
     print(
         "Output directory:",
         OUTPUT_DIR,
     )
+
     print(
         "Log directory:",
         LOG_DIR,
     )
+
+    print(
+        "JSON:",
+        (
+            "Enabled"
+            if SAVE_JSON
+            else "Disabled"
+        ),
+    )
+
     print(
         "PostgreSQL:",
-        database_status,
+        (
+            "Enabled"
+            if SAVE_DATABASE
+            else "Disabled"
+        ),
     )
+
+    if SAVE_DATABASE:
+        print(
+            "DB Host:",
+            CONFIG.database.host,
+        )
+
+        print(
+            "DB Port:",
+            CONFIG.database.port,
+        )
+
+        print(
+            "DB Name:",
+            CONFIG.database.database,
+        )
+
+        print(
+            "DB User:",
+            CONFIG.database.user,
+        )
+
+    print(
+        "Chunk max length:",
+        CHUNK_MAX_LENGTH,
+    )
+
     print(
         "Supported formats:",
         ", ".join(
-            PipelineFactory.supported_extensions()
+            PipelineFactory
+            .supported_extensions()
         ),
     )
-    print("========================================")
+
+    print(
+        "========================================"
+    )
 
 
 def print_batch_summary(
@@ -402,18 +553,31 @@ def print_batch_summary(
     print("====================")
     print("Batch Summary")
     print("====================")
+
     print(
         "Success:",
         success_count,
     )
+
     print(
         "Failed:",
         failure_count,
     )
+
     print(
         "Total:",
         total_count,
     )
+
+    print(
+        "JSON:",
+        (
+            "Enabled"
+            if SAVE_JSON
+            else "Disabled"
+        ),
+    )
+
     print(
         "PostgreSQL:",
         (
@@ -426,9 +590,9 @@ def print_batch_summary(
 
 def wait_before_exit() -> None:
     """
-    双击 EXE 运行时暂停窗口。
+    EXE 环境下暂停窗口。
 
-    普通 Python 开发环境中不暂停。
+    Python 开发环境不暂停。
     """
 
     if not IS_FROZEN:
@@ -448,23 +612,33 @@ def wait_before_exit() -> None:
 
 def main() -> None:
     """
-    批量处理 input 目录中的所有受支持文档。
+    Document Ingestion Platform 主入口。
 
-    开发环境：
-        python -m app.main
+    流程：
 
-        - 保存 JSON
-        - 保存 PostgreSQL
+        Config
+            ↓
 
-    EXE 环境：
-        DocumentIngestion.exe
+        Runtime Directories
+            ↓
 
-        - 保存 JSON
-        - 不连接 PostgreSQL
+        Input Discovery
+            ↓
+
+        PipelineFactory
+            ↓
+
+        PDF / DOCX / PPTX / XLSX Pipeline
+            ↓
+
+        JSON
+            +
+        PostgreSQL
     """
 
     ensure_directories()
     configure_logging()
+
     print_runtime_information()
 
     LOGGER.info(
@@ -478,6 +652,11 @@ def main() -> None:
             if IS_FROZEN
             else "python"
         ),
+    )
+
+    LOGGER.info(
+        "Environment: %s",
+        CONFIG.application.environment,
     )
 
     LOGGER.info(
@@ -501,16 +680,23 @@ def main() -> None:
     )
 
     LOGGER.info(
-        "JSON output enabled: %s",
+        "JSON enabled: %s",
         SAVE_JSON,
     )
 
     LOGGER.info(
-        "PostgreSQL storage enabled: %s",
+        "PostgreSQL enabled: %s",
         SAVE_DATABASE,
     )
 
-    files = discover_input_files()
+    LOGGER.info(
+        "Chunk max length: %s",
+        CHUNK_MAX_LENGTH,
+    )
+
+    files = (
+        discover_input_files()
+    )
 
     if not files:
         message = (
@@ -529,12 +715,12 @@ def main() -> None:
         return
 
     LOGGER.info(
-        "Discovered %s supported input files.",
+        "Discovered %s supported files.",
         len(files),
     )
 
     for file_path in files:
-        LOGGER.info(
+        LOGGER.debug(
             "Discovered input file: %s",
             file_path.name,
         )
@@ -560,23 +746,51 @@ def main() -> None:
     )
 
     LOGGER.info(
-        (
-            "Batch completed | "
-            "success=%s | "
-            "failed=%s | "
-            "total=%s | "
-            "save_json=%s | "
-            "save_database=%s"
-        ),
+        "Batch completed | "
+        "success=%s | "
+        "failed=%s | "
+        "total=%s",
         success_count,
         failure_count,
         len(files),
-        SAVE_JSON,
-        SAVE_DATABASE,
     )
 
     wait_before_exit()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except ConfigurationError as exc:
+        print()
+        print(
+            "Configuration Error:"
+        )
+        print(exc)
+
+        if IS_FROZEN:
+            try:
+                input(
+                    "\nPress Enter to exit..."
+                )
+
+            except (
+                EOFError,
+                KeyboardInterrupt,
+            ):
+                pass
+
+        raise SystemExit(
+            2
+        ) from exc
+
+    except KeyboardInterrupt:
+        print()
+        print(
+            "Operation cancelled by user."
+        )
+
+        raise SystemExit(
+            130
+        )

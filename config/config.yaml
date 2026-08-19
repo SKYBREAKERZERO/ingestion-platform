@@ -1,0 +1,27 @@
+application:
+  name: "Document Ingestion Platform"
+  environment: "development"
+
+runtime:
+  input_directory: "input"
+  output_directory: "output"
+  log_directory: "logs"
+
+output:
+  save_json: true
+
+database:
+  enabled: true
+  host: "127.0.0.1"
+  port: 5432
+  database: "rag"
+  user: "postgres"
+  password_env: "POSTGRES_PASSWORD"
+  connect_timeout: 10
+
+chunk:
+  max_length: 1000
+
+logging:
+  level: "INFO"
+  file_name: "application.log"
