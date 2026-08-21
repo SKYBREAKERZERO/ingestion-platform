@@ -1,38 +1,85 @@
-from typing import Optional
+from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Any
 
-from app.model.page import Page
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+)
+
 from app.model.block import DocumentBlock
 from app.model.chapter import Chapter
-from app.model.section import Section
 from app.model.content import Content
+from app.model.page import Page
+from app.model.section import Section
 
 
 class Document(BaseModel):
+    """
+    文档统一数据模型。
+
+    数据处理阶段：
+
+        Loader
+            ↓
+        pages / blocks
+            ↓
+        Parser
+            ↓
+        chapters / sections / contents
+            ↓
+        Filter / Chunk / Token
+            ↓
+        JSON / PostgreSQL / Vector Store
+
+    不同文件格式可以使用不同的原始结构：
+
+        PDF
+            主要使用 pages
+
+        DOCX
+            主要使用 blocks
+            同时维护逻辑 pages
+
+        PPTX
+            blocks + pages
+
+        XLSX
+            blocks + pages
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+    )
 
     # =====================
     # Basic Information
     # =====================
 
-    file_name: str
+    file_name: str = Field(
+        min_length=1,
+    )
 
-    file_type: str
-
-    # =====================
-    # Raw Pages (PDF)
-    # =====================
-
-    pages: list[Page] = Field(
-        default_factory=list
+    file_type: str = Field(
+        min_length=1,
     )
 
     # =====================
-    # Raw Blocks (DOCX / PPTX / XLSX ...)
+    # Raw / Logical Pages
+    # =====================
+
+    pages: list[Page] = Field(
+        default_factory=list,
+    )
+
+    # =====================
+    # Raw Structured Blocks
     # =====================
 
     blocks: list[DocumentBlock] = Field(
-        default_factory=list
+        default_factory=list,
     )
 
     # =====================
@@ -40,11 +87,11 @@ class Document(BaseModel):
     # =====================
 
     chapters: list[Chapter] = Field(
-        default_factory=list
+        default_factory=list,
     )
 
     sections: list[Section] = Field(
-        default_factory=list
+        default_factory=list,
     )
 
     # =====================
@@ -52,13 +99,13 @@ class Document(BaseModel):
     # =====================
 
     contents: list[Content] = Field(
-        default_factory=list
+        default_factory=list,
     )
 
     # =====================
     # Metadata
     # =====================
 
-    metadata: dict = Field(
-        default_factory=dict
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
     )

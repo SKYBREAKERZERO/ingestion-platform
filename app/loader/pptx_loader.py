@@ -135,6 +135,7 @@ class PPTXLoader(BaseLoader):
         maximum_shapes_per_slide: int | None = None,
         maximum_table_rows: int | None = None,
         maximum_table_columns: int | None = None,
+        print_summary: bool = False,
     ) -> None:
 
         if reading_order not in {
@@ -232,6 +233,10 @@ class PPTXLoader(BaseLoader):
             maximum_table_columns
         )
 
+        self.print_summary = bool(
+            print_summary
+        )
+
     def load(
         self,
         file_path: str | Path,
@@ -250,6 +255,9 @@ class PPTXLoader(BaseLoader):
                 path=path,
                 presentation=presentation,
             )
+
+        except PPTXLoaderError:
+            raise
 
         except Exception as exc:
             raise PPTXLoaderError(
@@ -597,10 +605,11 @@ class PPTXLoader(BaseLoader):
             "slides": slide_metadata,
         }
 
-        self._print_summary(
-            path=path,
-            metadata=metadata,
-        )
+        if self.print_summary:
+            self._print_summary(
+                path=path,
+                metadata=metadata,
+            )
 
         return Document(
             file_name=path.name,
@@ -718,15 +727,19 @@ class PPTXLoader(BaseLoader):
         )
 
         if not self.extract_text_per_paragraph:
+            normalized_paragraphs = [
+                self._normalize_text(
+                    paragraph.text
+                )
+                for paragraph in paragraphs
+            ]
+
             combined_text = (
                 self.paragraph_separator.join(
-                    self._normalize_text(
-                        paragraph.text
-                    )
-                    for paragraph in paragraphs
-                    if self._normalize_text(
-                        paragraph.text
-                    )
+                    text
+                    for text
+                    in normalized_paragraphs
+                    if text
                 )
             ).strip()
 
@@ -902,10 +915,17 @@ class PPTXLoader(BaseLoader):
 
                 cells.append(value)
 
-            cells = self._trim_empty_boundaries(
-                cells
-            )
-
+            # Loader 层保留所有 Cell 的列位置。
+            #
+            # 例如：
+            #
+            #     ["", "A", "", "C"]
+            #
+            # 不能在这里裁剪成：
+            #
+            #     ["A", "", "C"]
+            #
+            # 否则后续 TableFilter / Parser 已无法恢复原始列结构。
             if not any(cells):
                 continue
 
@@ -945,6 +965,15 @@ class PPTXLoader(BaseLoader):
                         "table_column_count": (
                             column_limit
                         ),
+                        "non_empty_cell_count": (
+                            sum(
+                                1
+                                for cell
+                                in cells
+                                if cell
+                            )
+                        ),
+                        "column_position_preserved": True,
                         "is_header_candidate": (
                             row_index == 0
                         ),
@@ -1860,15 +1889,17 @@ class PPTXLoader(BaseLoader):
             " ",
         )
 
-        normalized = normalized.replace(
+        for character in (
             "\u200b",
-            "",
-        )
-
-        normalized = normalized.replace(
+            "\u200c",
+            "\u200d",
+            "\u2060",
             "\ufeff",
-            "",
-        )
+        ):
+            normalized = normalized.replace(
+                character,
+                "",
+            )
 
         normalized = normalized.replace(
             "\r\n",
@@ -1961,6 +1992,18 @@ class PPTXLoader(BaseLoader):
         cls,
         file_path: str | Path,
     ) -> Path:
+
+        if file_path is None:
+            raise ValueError(
+                "file_path cannot be None."
+            )
+
+        if not str(
+            file_path
+        ).strip():
+            raise ValueError(
+                "file_path cannot be empty."
+            )
 
         path = Path(
             file_path

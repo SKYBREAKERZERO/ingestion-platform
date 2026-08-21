@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import math
 import re
+
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
-from app.model.block import BlockType, DocumentBlock
+from app.model.block import (
+    BlockType,
+    DocumentBlock,
+)
 from app.model.document import Document
 from app.model.page import Page
 
 
-class ShapeFilterError(RuntimeError):
-    """PPTX Shape 过滤异常。"""
+class ShapeFilterError(
+    RuntimeError
+):
+    """
+    PPTX Shape 过滤异常。
+    """
 
 
 class ShapeFilter:
@@ -23,7 +32,7 @@ class ShapeFilter:
         - 删除空表格行
         - 删除无有效信息的图片或图表块
         - 删除重复文本块
-        - 删除页码、日期、版本号、公司页脚等噪声
+        - 删除边缘区域页码、日期、版本号、公司页脚
         - 删除跨页高频重复页眉页脚
         - 清洗文本和单元格
         - 保留 Slide 内视觉顺序
@@ -38,7 +47,18 @@ class ShapeFilter:
         - Chapter / Section 建模
         - Chunk
         - Token 统计
+
+    设计原则：
+        - document.blocks 是 PPTX 的结构数据源
+        - document.pages 是逻辑文本视图
+        - 页眉页脚类噪声仅在 Slide 边缘区域删除
+        - 去重主要针对文本 Block
+        - Table / Image / Chart 不进行普通文本式去重
     """
+
+    # ==================================================
+    # Page Number
+    # ==================================================
 
     _PAGE_NUMBER_PATTERNS = (
         re.compile(
@@ -48,7 +68,8 @@ class ShapeFilter:
             r"^\d+\s*/\s*\d+$"
         ),
         re.compile(
-            r"^page\s+\d+(?:\s+of\s+\d+)?$",
+            r"^page\s+\d+"
+            r"(?:\s+of\s+\d+)?$",
             re.IGNORECASE,
         ),
         re.compile(
@@ -56,38 +77,62 @@ class ShapeFilter:
         ),
     )
 
+    # ==================================================
+    # Date
+    # ==================================================
+
     _DATE_PATTERNS = (
         re.compile(
-            r"^(?:19|20)\d{2}[./-]\d{1,2}[./-]\d{1,2}$"
+            r"^(?:19|20)\d{2}"
+            r"[./-]\d{1,2}"
+            r"[./-]\d{1,2}$"
         ),
         re.compile(
-            r"^\d{1,2}[./-]\d{1,2}[./-](?:19|20)\d{2}$"
+            r"^\d{1,2}"
+            r"[./-]\d{1,2}"
+            r"[./-](?:19|20)\d{2}$"
         ),
     )
 
+    # ==================================================
+    # Version
+    # ==================================================
+
     _VERSION_PATTERNS = (
         re.compile(
-            r"^[vVｖＶ]\s*\d+(?:\.\d+)+$"
+            r"^[vVｖＶ]\s*"
+            r"\d+(?:\.\d+)+$"
         ),
         re.compile(
-            r"^(?:ver|version)\.?\s*\d+(?:\.\d+)+$",
+            r"^(?:ver|version)"
+            r"\.?\s*"
+            r"\d+(?:\.\d+)+$",
             re.IGNORECASE,
         ),
         re.compile(
-            r"^rev(?:ision)?\.?\s*[A-Za-z0-9._-]+$",
+            r"^rev(?:ision)?"
+            r"\.?\s*"
+            r"[A-Za-z0-9._-]+$",
             re.IGNORECASE,
         ),
     )
+
+    # ==================================================
+    # Static Noise
+    # ==================================================
 
     _STATIC_NOISE_PATTERNS = (
         re.compile(
             r"^TOYOTA\s+MOTOR\s+CORPORATION"
-            r"(?:\s+[vVｖＶ]?\d+(?:\.\d+)*)?$",
+            r"(?:\s+[vVｖＶ]?"
+            r"\d+(?:\.\d+)*)?$",
             re.IGNORECASE,
         ),
         re.compile(
-            r"^DENSO(?:\s+TEN)?\s+CORPORATION"
-            r"(?:\s+[vVｖＶ]?\d+(?:\.\d+)*)?$",
+            r"^DENSO(?:\s+TEN)?"
+            r"\s+CORPORATION"
+            r"(?:\s+[vVｖＶ]?"
+            r"\d+(?:\.\d+)*)?$",
             re.IGNORECASE,
         ),
         re.compile(
@@ -108,20 +153,31 @@ class ShapeFilter:
         ),
     )
 
+    # ==================================================
+    # Ignore Patterns
+    # ==================================================
+
     _DEFAULT_IGNORE_PATTERNS = (
         re.compile(
-            r"^(?:click to add title|click to add text)$",
+            r"^(?:click to add title"
+            r"|click to add text)$",
             re.IGNORECASE,
         ),
         re.compile(
-            r"^(?:タイトルを入力|テキストを入力)$",
+            r"^(?:タイトルを入力"
+            r"|テキストを入力)$",
             re.IGNORECASE,
         ),
         re.compile(
-            r"^(?:单击此处添加标题|单击此处添加文本)$",
+            r"^(?:单击此处添加标题"
+            r"|单击此处添加文本)$",
             re.IGNORECASE,
         ),
     )
+
+    # ==================================================
+    # Text Block Types
+    # ==================================================
 
     _TEXT_BLOCK_TYPES = {
         BlockType.HEADING,
@@ -129,6 +185,10 @@ class ShapeFilter:
         BlockType.LIST,
         BlockType.TEXTBOX,
     }
+
+    # ==================================================
+    # Constructor
+    # ==================================================
 
     def __init__(
         self,
@@ -169,24 +229,40 @@ class ShapeFilter:
                 "'slide' or 'presentation'."
             )
 
-        if not 0 < repeated_edge_ratio <= 1:
+        if not (
+            0
+            < repeated_edge_ratio
+            <= 1
+        ):
             raise ValueError(
-                "repeated_edge_ratio must be between 0 and 1."
+                "repeated_edge_ratio must be "
+                "between 0 and 1."
             )
 
         if minimum_edge_repetition < 1:
             raise ValueError(
-                "minimum_edge_repetition must be at least 1."
+                "minimum_edge_repetition "
+                "must be at least 1."
             )
 
-        if not 0 <= header_position_ratio < 1:
+        if not (
+            0
+            <= header_position_ratio
+            < 1
+        ):
             raise ValueError(
-                "header_position_ratio must be between 0 and 1."
+                "header_position_ratio must be "
+                "between 0 and 1."
             )
 
-        if not 0 < footer_position_ratio <= 1:
+        if not (
+            0
+            < footer_position_ratio
+            <= 1
+        ):
             raise ValueError(
-                "footer_position_ratio must be between 0 and 1."
+                "footer_position_ratio must be "
+                "between 0 and 1."
             )
 
         if (
@@ -194,13 +270,14 @@ class ShapeFilter:
             >= footer_position_ratio
         ):
             raise ValueError(
-                "header_position_ratio must be less than "
-                "footer_position_ratio."
+                "header_position_ratio must be "
+                "less than footer_position_ratio."
             )
 
         if minimum_text_length < 0:
             raise ValueError(
-                "minimum_text_length cannot be negative."
+                "minimum_text_length "
+                "cannot be negative."
             )
 
         if (
@@ -208,7 +285,8 @@ class ShapeFilter:
             and maximum_text_length <= 0
         ):
             raise ValueError(
-                "maximum_text_length must be greater than 0."
+                "maximum_text_length "
+                "must be greater than 0."
             )
 
         if (
@@ -217,8 +295,8 @@ class ShapeFilter:
             < minimum_text_length
         ):
             raise ValueError(
-                "maximum_text_length cannot be less than "
-                "minimum_text_length."
+                "maximum_text_length cannot "
+                "be less than minimum_text_length."
             )
 
         self.remove_empty_text_blocks = (
@@ -294,8 +372,12 @@ class ShapeFilter:
         )
 
         self.clean_text = clean_text
+
         self.clean_cells = clean_cells
-        self.rebuild_pages = rebuild_pages
+
+        self.rebuild_pages = (
+            rebuild_pages
+        )
 
         self.reassign_block_order = (
             reassign_block_order
@@ -308,7 +390,9 @@ class ShapeFilter:
         )
 
         if ignore_patterns:
+
             for pattern in ignore_patterns:
+
                 if isinstance(
                     pattern,
                     re.Pattern,
@@ -316,10 +400,13 @@ class ShapeFilter:
                     patterns.append(
                         pattern
                     )
+
                 else:
                     patterns.append(
                         re.compile(
-                            str(pattern),
+                            str(
+                                pattern
+                            ),
                             re.IGNORECASE,
                         )
                     )
@@ -327,6 +414,10 @@ class ShapeFilter:
         self.ignore_patterns = tuple(
             patterns
         )
+
+    # ==================================================
+    # Public API
+    # ==================================================
 
     def filter(
         self,
@@ -338,20 +429,27 @@ class ShapeFilter:
         )
 
         try:
+
             original_block_count = len(
                 document.blocks
             )
 
-            repeated_edge_texts = set()
+            repeated_edge_texts: set[str] = (
+                set()
+            )
 
-            if self.remove_repeated_headers_footers:
+            if (
+                self.remove_repeated_headers_footers
+            ):
                 repeated_edge_texts = (
                     self._find_repeated_edge_texts(
                         document
                     )
                 )
 
-            presentation_seen: set[str] = set()
+            presentation_seen: set[str] = (
+                set()
+            )
 
             slide_seen: dict[
                 int,
@@ -363,26 +461,45 @@ class ShapeFilter:
             ] = []
 
             removed_empty_text_count = 0
+
             removed_empty_table_count = 0
+
             removed_empty_image_count = 0
+
             removed_empty_chart_count = 0
+
             removed_duplicate_count = 0
+
             removed_page_number_count = 0
+
             removed_date_count = 0
+
             removed_version_count = 0
+
             removed_static_noise_count = 0
+
             removed_repeated_edge_count = 0
+
             removed_pattern_count = 0
+
             removed_short_count = 0
+
             removed_long_count = 0
 
             for block in sorted(
                 document.blocks,
                 key=self._block_sort_key,
             ):
-                updated_block = block.model_copy(
-                    deep=True
+
+                updated_block = (
+                    block.model_copy(
+                        deep=True
+                    )
                 )
+
+                # ======================================
+                # Normalize Text
+                # ======================================
 
                 if self.clean_text:
                     updated_block.text = (
@@ -391,10 +508,15 @@ class ShapeFilter:
                         )
                     )
 
+                # ======================================
+                # Normalize Cells
+                # ======================================
+
                 if (
                     self.clean_cells
                     and updated_block.cells
                 ):
+
                     updated_block.cells = [
                         self._normalize_text(
                             cell
@@ -419,7 +541,9 @@ class ShapeFilter:
                             ).strip()
                         )
 
-                text = updated_block.text.strip()
+                text = (
+                    updated_block.text.strip()
+                )
 
                 content_kind = str(
                     updated_block.metadata.get(
@@ -428,9 +552,9 @@ class ShapeFilter:
                     )
                 ).strip().lower()
 
-                # =====================
-                # Empty blocks
-                # =====================
+                # ======================================
+                # Empty Text Blocks
+                # ======================================
 
                 if (
                     updated_block.block_type
@@ -440,6 +564,10 @@ class ShapeFilter:
                 ):
                     removed_empty_text_count += 1
                     continue
+
+                # ======================================
+                # Empty Table
+                # ======================================
 
                 if (
                     updated_block.block_type
@@ -452,6 +580,10 @@ class ShapeFilter:
                     removed_empty_table_count += 1
                     continue
 
+                # ======================================
+                # Empty Image
+                # ======================================
+
                 if (
                     updated_block.block_type
                     == BlockType.IMAGE
@@ -461,6 +593,10 @@ class ShapeFilter:
                     removed_empty_image_count += 1
                     continue
 
+                # ======================================
+                # Empty Chart
+                # ======================================
+
                 if (
                     content_kind == "chart"
                     and not text
@@ -469,16 +605,24 @@ class ShapeFilter:
                     removed_empty_chart_count += 1
                     continue
 
-                # 无文本但有重要图片/图表元数据时保留。
+                # ======================================
+                # Important Empty Non-text Block
+                # ======================================
+                #
+                # Image / Chart 可能没有 text，
+                # 但 metadata 中仍然存在重要信息。
+                #
+                # 此类 Block 默认保留。
+
                 if not text:
                     retained_blocks.append(
                         updated_block
                     )
                     continue
 
-                # =====================
-                # Length
-                # =====================
+                # ======================================
+                # Text Length
+                # ======================================
 
                 if (
                     len(text)
@@ -496,9 +640,9 @@ class ShapeFilter:
                     removed_long_count += 1
                     continue
 
-                # =====================
-                # Explicit patterns
-                # =====================
+                # ======================================
+                # Explicit Ignore Patterns
+                # ======================================
 
                 if self._matches_patterns(
                     text,
@@ -507,12 +651,32 @@ class ShapeFilter:
                     removed_pattern_count += 1
                     continue
 
-                # =====================
-                # Page / date / version
-                # =====================
+                # ======================================
+                # Edge Position
+                # ======================================
+
+                is_edge_block = (
+                    self._is_edge_block(
+                        updated_block,
+                        document,
+                    )
+                )
+
+                # ======================================
+                # Page Number
+                # ======================================
+                #
+                # 只在边缘区域删除。
+                #
+                # 避免 Slide 正文中：
+                #
+                #   1
+                #
+                # 被误当成页码删除。
 
                 if (
                     self.remove_page_numbers
+                    and is_edge_block
                     and self._matches_patterns(
                         text,
                         self._PAGE_NUMBER_PATTERNS,
@@ -521,8 +685,13 @@ class ShapeFilter:
                     removed_page_number_count += 1
                     continue
 
+                # ======================================
+                # Date
+                # ======================================
+
                 if (
                     self.remove_dates
+                    and is_edge_block
                     and self._matches_patterns(
                         text,
                         self._DATE_PATTERNS,
@@ -531,8 +700,13 @@ class ShapeFilter:
                     removed_date_count += 1
                     continue
 
+                # ======================================
+                # Version
+                # ======================================
+
                 if (
                     self.remove_version_lines
+                    and is_edge_block
                     and self._matches_patterns(
                         text,
                         self._VERSION_PATTERNS,
@@ -541,8 +715,13 @@ class ShapeFilter:
                     removed_version_count += 1
                     continue
 
+                # ======================================
+                # Static Noise
+                # ======================================
+
                 if (
                     self.remove_static_noise
+                    and is_edge_block
                     and self._matches_patterns(
                         text,
                         self._STATIC_NOISE_PATTERNS,
@@ -551,9 +730,9 @@ class ShapeFilter:
                     removed_static_noise_count += 1
                     continue
 
-                # =====================
-                # Repeated header/footer
-                # =====================
+                # ======================================
+                # Repeated Header / Footer
+                # ======================================
 
                 normalized_key = (
                     self._normalize_duplicate_key(
@@ -565,19 +744,26 @@ class ShapeFilter:
                     repeated_edge_texts
                     and normalized_key
                     in repeated_edge_texts
-                    and self._is_edge_block(
-                        updated_block,
-                        document,
-                    )
+                    and is_edge_block
                 ):
                     removed_repeated_edge_count += 1
                     continue
 
-                # =====================
+                # ======================================
                 # Duplicate
-                # =====================
+                # ======================================
+                #
+                # 只对真正的文本类 Block 去重。
+                #
+                # TABLE / IMAGE / CHART 不使用普通
+                # text key 去重，否则可能误删结构数据。
 
-                if self.remove_duplicate_blocks:
+                if (
+                    self.remove_duplicate_blocks
+                    and updated_block.block_type
+                    in self._TEXT_BLOCK_TYPES
+                ):
+
                     slide_index = (
                         self._resolve_slide_index(
                             updated_block
@@ -588,6 +774,7 @@ class ShapeFilter:
                         self.duplicate_scope
                         == "presentation"
                     ):
+
                         if (
                             normalized_key
                             in presentation_seen
@@ -600,9 +787,12 @@ class ShapeFilter:
                         )
 
                     else:
-                        seen = slide_seen.setdefault(
-                            slide_index,
-                            set(),
+
+                        seen = (
+                            slide_seen.setdefault(
+                                slide_index,
+                                set(),
+                            )
                         )
 
                         if normalized_key in seen:
@@ -613,13 +803,19 @@ class ShapeFilter:
                             normalized_key
                         )
 
+                # ======================================
+                # Retain
+                # ======================================
+
                 updated_block.metadata.update(
                     {
                         "shape_filter_status": (
                             "RETAINED"
                         ),
                         "normalized_text_length": (
-                            len(text)
+                            len(
+                                text
+                            )
                         ),
                     }
                 )
@@ -628,7 +824,12 @@ class ShapeFilter:
                     updated_block
                 )
 
+            # ==========================================
+            # Reassign Block Order
+            # ==========================================
+
             if self.reassign_block_order:
+
                 for order, block in enumerate(
                     retained_blocks
                 ):
@@ -638,87 +839,127 @@ class ShapeFilter:
                 retained_blocks
             )
 
+            # ==========================================
+            # Rebuild Pages
+            # ==========================================
+
             if self.rebuild_pages:
                 self._rebuild_pages(
                     document
                 )
 
+            # ==========================================
+            # Update Slide Metadata
+            # ==========================================
+
             self._update_slide_metadata(
                 document
             )
+
+            # ==========================================
+            # Filter Metadata
+            # ==========================================
 
             document.metadata.update(
                 {
                     "shape_filter": (
                         "ShapeFilter"
                     ),
+
                     "shape_filter_status": (
                         "SUCCESS"
                     ),
+
                     "shape_filter_original_block_count": (
                         original_block_count
                     ),
+
                     "shape_filter_retained_block_count": (
-                        len(retained_blocks)
+                        len(
+                            retained_blocks
+                        )
                     ),
+
                     "shape_filter_removed_block_count": (
                         original_block_count
-                        - len(retained_blocks)
+                        - len(
+                            retained_blocks
+                        )
                     ),
+
                     "shape_filter_removed_empty_text_count": (
                         removed_empty_text_count
                     ),
+
                     "shape_filter_removed_empty_table_count": (
                         removed_empty_table_count
                     ),
+
                     "shape_filter_removed_empty_image_count": (
                         removed_empty_image_count
                     ),
+
                     "shape_filter_removed_empty_chart_count": (
                         removed_empty_chart_count
                     ),
+
                     "shape_filter_removed_duplicate_count": (
                         removed_duplicate_count
                     ),
+
                     "shape_filter_removed_page_number_count": (
                         removed_page_number_count
                     ),
+
                     "shape_filter_removed_date_count": (
                         removed_date_count
                     ),
+
                     "shape_filter_removed_version_count": (
                         removed_version_count
                     ),
+
                     "shape_filter_removed_static_noise_count": (
                         removed_static_noise_count
                     ),
+
                     "shape_filter_removed_repeated_edge_count": (
                         removed_repeated_edge_count
                     ),
+
                     "shape_filter_removed_pattern_count": (
                         removed_pattern_count
                     ),
+
                     "shape_filter_removed_short_count": (
                         removed_short_count
                     ),
+
                     "shape_filter_removed_long_count": (
                         removed_long_count
                     ),
+
                     "shape_filter_repeated_edge_candidate_count": (
-                        len(repeated_edge_texts)
+                        len(
+                            repeated_edge_texts
+                        )
                     ),
                 }
             )
 
             return document
 
+        except ShapeFilterError:
+            raise
+
         except Exception as exc:
             raise ShapeFilterError(
-                f"Failed to filter PPTX shapes: {exc}"
+                "Failed to filter PPTX "
+                f"shapes: {exc}"
             ) from exc
 
     # ==================================================
-    # Repeated header/footer detection
+    # Repeated Header / Footer
     # ==================================================
 
     def _find_repeated_edge_texts(
@@ -730,7 +971,8 @@ class ShapeFilter:
             self._resolve_slide_index(
                 block
             )
-            for block in document.blocks
+            for block
+            in document.blocks
         }
 
         slide_count = len(
@@ -740,7 +982,9 @@ class ShapeFilter:
         if slide_count < 3:
             return set()
 
-        counter: Counter[str] = Counter()
+        counter: Counter[str] = (
+            Counter()
+        )
 
         per_slide_seen: dict[
             int,
@@ -748,6 +992,7 @@ class ShapeFilter:
         ] = {}
 
         for block in document.blocks:
+
             text = self._normalize_text(
                 block.text
             )
@@ -773,20 +1018,42 @@ class ShapeFilter:
                 )
             )
 
-            seen = per_slide_seen.setdefault(
-                slide_index,
-                set(),
+            if not key:
+                continue
+
+            seen = (
+                per_slide_seen.setdefault(
+                    slide_index,
+                    set(),
+                )
             )
 
             if key in seen:
                 continue
 
-            seen.add(key)
-            counter[key] += 1
+            seen.add(
+                key
+            )
+
+            counter[
+                key
+            ] += 1
+
+        # ==============================================
+        # Threshold
+        # ==============================================
+        #
+        # 使用 ceil：
+        #
+        # 8 slides * 0.4 = 3.2
+        #
+        # 必须至少出现 4 张 Slide。
+        #
+        # 不能使用 int(3.2)=3。
 
         threshold = max(
             self.minimum_edge_repetition,
-            int(
+            math.ceil(
                 slide_count
                 * self.repeated_edge_ratio
             ),
@@ -794,9 +1061,14 @@ class ShapeFilter:
 
         return {
             text
-            for text, count in counter.items()
+            for text, count
+            in counter.items()
             if count >= threshold
         }
+
+    # ==================================================
+    # Edge Detection
+    # ==================================================
 
     def _is_edge_block(
         self,
@@ -804,7 +1076,10 @@ class ShapeFilter:
         document: Document,
     ) -> bool:
 
-        metadata = block.metadata or {}
+        metadata = (
+            block.metadata
+            or {}
+        )
 
         top = metadata.get(
             "top_emu"
@@ -814,8 +1089,10 @@ class ShapeFilter:
             "height_emu"
         )
 
-        slide_height = document.metadata.get(
-            "slide_height_emu"
+        slide_height = (
+            document.metadata.get(
+                "slide_height_emu"
+            )
         )
 
         if (
@@ -825,10 +1102,16 @@ class ShapeFilter:
             return False
 
         try:
-            top_value = float(top)
-            height_value = float(
-                height or 0
+
+            top_value = float(
+                top
             )
+
+            height_value = float(
+                height
+                or 0
+            )
+
             slide_height_value = float(
                 slide_height
             )
@@ -848,9 +1131,12 @@ class ShapeFilter:
         )
 
         bottom_ratio = (
-            top_value
-            + height_value
-        ) / slide_height_value
+            (
+                top_value
+                + height_value
+            )
+            / slide_height_value
+        )
 
         return (
             top_ratio
@@ -860,7 +1146,7 @@ class ShapeFilter:
         )
 
     # ==================================================
-    # Rebuild
+    # Rebuild Pages
     # ==================================================
 
     @classmethod
@@ -875,6 +1161,7 @@ class ShapeFilter:
         ] = {}
 
         for block in document.blocks:
+
             slide_index = (
                 cls._resolve_slide_index(
                     block
@@ -892,12 +1179,16 @@ class ShapeFilter:
             Page
         ] = []
 
-        for logical_page_number, slide_index in enumerate(
+        for (
+            logical_page_number,
+            slide_index,
+        ) in enumerate(
             sorted(
                 blocks_by_slide
             ),
             start=1,
         ):
+
             slide_blocks = sorted(
                 blocks_by_slide[
                     slide_index
@@ -907,7 +1198,8 @@ class ShapeFilter:
 
             text = "\n".join(
                 block.text.strip()
-                for block in slide_blocks
+                for block
+                in slide_blocks
                 if (
                     block.text
                     and block.text.strip()
@@ -924,15 +1216,24 @@ class ShapeFilter:
             )
 
             for block in slide_blocks:
+
                 block.page_number = (
                     logical_page_number
                 )
 
                 block.metadata[
                     "logical_page_number"
-                ] = logical_page_number
+                ] = (
+                    logical_page_number
+                )
 
-        document.pages = rebuilt_pages
+        document.pages = (
+            rebuilt_pages
+        )
+
+    # ==================================================
+    # Slide Metadata
+    # ==================================================
 
     @classmethod
     def _update_slide_metadata(
@@ -951,6 +1252,7 @@ class ShapeFilter:
         ] = {}
 
         for block in document.blocks:
+
             slide_index = (
                 cls._resolve_slide_index(
                     block
@@ -980,15 +1282,18 @@ class ShapeFilter:
                 )
             )
 
-        raw_records = document.metadata.get(
-            "slides",
-            [],
+        raw_records = (
+            document.metadata.get(
+                "slides",
+                [],
+            )
         )
 
         if isinstance(
             raw_records,
             list,
         ):
+
             updated_records: list[
                 dict[str, Any]
             ] = []
@@ -996,22 +1301,32 @@ class ShapeFilter:
             logical_page_number = 1
 
             for record in raw_records:
+
                 if not isinstance(
                     record,
                     dict,
                 ):
                     continue
 
-                slide_index = record.get(
-                    "slide_index"
+                slide_index = (
+                    record.get(
+                        "slide_index"
+                    )
                 )
 
                 if slide_index is None:
                     continue
 
-                slide_index = int(
-                    slide_index
-                )
+                try:
+                    slide_index = int(
+                        slide_index
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
 
                 if (
                     slide_index
@@ -1025,19 +1340,25 @@ class ShapeFilter:
 
                 updated[
                     "logical_page_number"
-                ] = logical_page_number
+                ] = (
+                    logical_page_number
+                )
 
                 updated[
                     "block_count"
-                ] = block_counts[
-                    slide_index
-                ]
+                ] = (
+                    block_counts[
+                        slide_index
+                    ]
+                )
 
                 updated[
                     "character_count"
-                ] = character_counts[
-                    slide_index
-                ]
+                ] = (
+                    character_counts[
+                        slide_index
+                    ]
+                )
 
                 updated[
                     "status"
@@ -1051,7 +1372,9 @@ class ShapeFilter:
 
             document.metadata[
                 "slides"
-            ] = updated_records
+            ] = (
+                updated_records
+            )
 
         document.metadata[
             "processed_slide_count"
@@ -1078,11 +1401,12 @@ class ShapeFilter:
                 page.text
                 or ""
             )
-            for page in document.pages
+            for page
+            in document.pages
         )
 
     # ==================================================
-    # Helpers
+    # Resolve Slide Index
     # ==================================================
 
     @staticmethod
@@ -1090,43 +1414,94 @@ class ShapeFilter:
         block: DocumentBlock,
     ) -> int:
 
-        metadata = block.metadata or {}
+        metadata = (
+            block.metadata
+            or {}
+        )
 
-        slide_index = metadata.get(
-            "slide_index"
+        slide_index = (
+            metadata.get(
+                "slide_index"
+            )
         )
 
         if slide_index is not None:
-            return int(
-                slide_index
-            )
 
-        slide_number = metadata.get(
-            "slide_number"
+            try:
+                return int(
+                    slide_index
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+        slide_number = (
+            metadata.get(
+                "slide_number"
+            )
         )
 
         if slide_number is not None:
-            return int(
-                slide_number
-            ) - 1
 
-        if block.page_number is not None:
-            return (
-                int(
-                    block.page_number
+            try:
+                return max(
+                    int(
+                        slide_number
+                    )
+                    - 1,
+                    0,
                 )
-                - 1
-            )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+        if (
+            block.page_number
+            is not None
+        ):
+
+            try:
+                return max(
+                    int(
+                        block.page_number
+                    )
+                    - 1,
+                    0,
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
 
         return 0
+
+    # ==================================================
+    # Sort Key
+    # ==================================================
 
     @classmethod
     def _block_sort_key(
         cls,
         block: DocumentBlock,
-    ) -> tuple[int, int, int, int]:
+    ) -> tuple[
+        int,
+        int,
+        int,
+        int,
+    ]:
 
-        metadata = block.metadata or {}
+        metadata = (
+            block.metadata
+            or {}
+        )
 
         slide_index = (
             cls._resolve_slide_index(
@@ -1134,15 +1509,22 @@ class ShapeFilter:
             )
         )
 
-        visual_index = int(
-            metadata.get(
-                "visual_index",
-                0,
+        try:
+            visual_index = int(
+                metadata.get(
+                    "visual_index",
+                    0,
+                )
+                or 0
             )
-            or 0
-        )
 
-        paragraph_or_row_index = int(
+        except (
+            TypeError,
+            ValueError,
+        ):
+            visual_index = 0
+
+        raw_paragraph_or_row_index = (
             metadata.get(
                 "paragraph_index",
                 metadata.get(
@@ -1150,8 +1532,21 @@ class ShapeFilter:
                     0,
                 ),
             )
-            or 0
         )
+
+        try:
+            paragraph_or_row_index = (
+                int(
+                    raw_paragraph_or_row_index
+                    or 0
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            paragraph_or_row_index = 0
 
         return (
             slide_index,
@@ -1160,13 +1555,19 @@ class ShapeFilter:
             block.order,
         )
 
+    # ==================================================
+    # Duplicate Key
+    # ==================================================
+
     def _normalize_duplicate_key(
         self,
         text: str,
     ) -> str:
 
-        normalized = self._normalize_text(
-            text
+        normalized = (
+            self._normalize_text(
+                text
+            )
         )
 
         if (
@@ -1177,6 +1578,10 @@ class ShapeFilter:
             )
 
         return normalized
+
+    # ==================================================
+    # Match Patterns
+    # ==================================================
 
     @staticmethod
     def _matches_patterns(
@@ -1191,8 +1596,13 @@ class ShapeFilter:
                 text
             )
             is not None
-            for pattern in patterns
+            for pattern
+            in patterns
         )
+
+    # ==================================================
+    # Trim Cells
+    # ==================================================
 
     @staticmethod
     def _trim_empty_boundaries(
@@ -1203,23 +1613,34 @@ class ShapeFilter:
             return []
 
         start = 0
-        end = len(values)
+
+        end = len(
+            values
+        )
 
         while (
             start < end
-            and not values[start]
+            and not values[
+                start
+            ]
         ):
             start += 1
 
         while (
             end > start
-            and not values[end - 1]
+            and not values[
+                end - 1
+            ]
         ):
             end -= 1
 
         return values[
             start:end
         ]
+
+    # ==================================================
+    # Normalize Text
+    # ==================================================
 
     @staticmethod
     def _normalize_text(
@@ -1233,47 +1654,67 @@ class ShapeFilter:
             value
         )
 
-        normalized = normalized.replace(
-            "\u3000",
-            " ",
+        # Full-width Space
+        normalized = (
+            normalized.replace(
+                "\u3000",
+                " ",
+            )
         )
 
-        normalized = normalized.replace(
-            "\xa0",
-            " ",
+        # NBSP
+        normalized = (
+            normalized.replace(
+                "\xa0",
+                " ",
+            )
         )
 
-        normalized = normalized.replace(
+        # Zero-width Characters
+        for character in (
             "\u200b",
-            "",
-        )
-
-        normalized = normalized.replace(
+            "\u200c",
+            "\u200d",
+            "\u2060",
             "\ufeff",
-            "",
+        ):
+            normalized = (
+                normalized.replace(
+                    character,
+                    "",
+                )
+            )
+
+        normalized = (
+            normalized.replace(
+                "\r\n",
+                "\n",
+            )
         )
 
-        normalized = normalized.replace(
-            "\r\n",
-            "\n",
-        )
-
-        normalized = normalized.replace(
-            "\r",
-            "\n",
+        normalized = (
+            normalized.replace(
+                "\r",
+                "\n",
+            )
         )
 
         lines = [
             " ".join(
                 line.split()
             )
-            for line in normalized.splitlines()
+            for line
+            in normalized.splitlines()
             if line.strip()
         ]
 
         return "\n".join(
             lines
         ).strip()
+
+    # ==================================================
+    # Validation
+    # ==================================================
 
     @staticmethod
     def _validate_document(
@@ -1291,12 +1732,25 @@ class ShapeFilter:
         ):
             raise TypeError(
                 "ShapeFilter expects an "
-                "app.model.document.Document instance."
+                "app.model.document.Document "
+                "instance."
             )
 
-        if document.file_type.lower() != "pptx":
+        file_type = str(
+            document.file_type
+            or ""
+        ).strip().lower()
+
+        if file_type != "pptx":
             raise ValueError(
-                "ShapeFilter only accepts PPTX documents. "
+                "ShapeFilter only accepts "
+                "PPTX documents. "
                 f"Received file_type: "
                 f"{document.file_type}"
+            )
+
+        if not document.blocks:
+            raise ValueError(
+                "PPTX document contains "
+                "no blocks."
             )

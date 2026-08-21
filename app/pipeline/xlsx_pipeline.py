@@ -35,14 +35,16 @@ class XLSXPipeline:
         5. 解析 Sheet、数据区域和正文
         6. 去重
         7. 建立 Section 层级
-        8. 分配排序字段
-        9. 清理无效正文
-        10. Chunk 分块
+        8. 清理无效正文
+        9. Chunk 分块
+        10. 分配排序字段和 Chunk Index
         11. 统计最终 Chunk Token
-        12. 输出 JSON
-        13. 保存 PostgreSQL
+        12. 写入 Pipeline Metadata
+        13. 输出 JSON
+        14. 保存 PostgreSQL
 
     默认结构映射：
+
         Worksheet
             -> Chapter
 
@@ -59,14 +61,34 @@ class XLSXPipeline:
         chunk_max_length: int = 1000,
         save_json: bool = True,
         save_database: bool = True,
+
+        # =====================
+        # Loader options
+        # =====================
+
         loader_read_only: bool = True,
-        loader_data_only: bool = True,
+        loader_data_only: bool = False,
+
+        # =====================
+        # Sheet options
+        # =====================
+
         include_hidden_sheets: bool = False,
         include_very_hidden_sheets: bool = False,
         exclude_default_sheet_names: bool = False,
-        remove_duplicate_rows: bool = True,
+
+        # =====================
+        # Row filter options
+        # =====================
+
+        remove_duplicate_rows: bool = False,
         remove_comment_rows: bool = False,
         remove_summary_rows: bool = False,
+
+        # =====================
+        # Parser options
+        # =====================
+
         first_row_as_header: bool = True,
         include_header_in_content: bool = True,
         detect_multiple_regions: bool = True,
@@ -83,22 +105,34 @@ class XLSXPipeline:
                 "maximum_row_gap must be at least 1."
             )
 
-        self.save_json_enabled = save_json
-        self.save_database_enabled = save_database
+        self.save_json_enabled = bool(
+            save_json
+        )
+
+        self.save_database_enabled = bool(
+            save_database
+        )
 
         # =====================
         # Loader
         # =====================
+        #
+        # Loader 层尽量无损读取 Sheet。
+        #
+        # 是否最终保留 hidden / veryHidden Sheet，
+        # 统一交给 SheetFilter 决定。
+        #
+        # 这样：
+        #
+        #     - Loader metadata 更完整
+        #     - SheetFilter 可以记录删除原因
+        #     - 不会在 Loader 阶段提前丢失结构信息
 
         self.loader = XLSXLoader(
             read_only=loader_read_only,
             data_only=loader_data_only,
-            include_hidden_sheets=(
-                include_hidden_sheets
-            ),
-            include_very_hidden_sheets=(
-                include_very_hidden_sheets
-            ),
+            include_hidden_sheets=True,
+            include_very_hidden_sheets=True,
         )
 
         # =====================
@@ -142,14 +176,26 @@ class XLSXPipeline:
             minimum_non_empty_cells=1,
             minimum_text_length=1,
             duplicate_scope="sheet",
-            case_sensitive_duplicates=False,
+
+            # 表格业务数据通常大小写有意义。
+            #
+            # 例如：
+            #
+            #     abc
+            #     ABC
+            #
+            # 不应默认视为完全相同的业务行。
+            case_sensitive_duplicates=True,
+
             strip_cells=True,
             collapse_internal_spaces=True,
             rebuild_pages=True,
             reassign_block_order=True,
         )
 
-        self.content_filter = ContentFilter()
+        self.content_filter = (
+            ContentFilter()
+        )
 
         # =====================
         # Parser
@@ -162,7 +208,9 @@ class XLSXPipeline:
             detect_multiple_regions=(
                 detect_multiple_regions
             ),
-            maximum_row_gap=maximum_row_gap,
+            maximum_row_gap=(
+                maximum_row_gap
+            ),
             include_header_in_content=(
                 include_header_in_content
             ),
@@ -173,28 +221,40 @@ class XLSXPipeline:
         # Common Processors
         # =====================
 
-        self.deduplicator = Deduplicator()
+        self.deduplicator = (
+            Deduplicator()
+        )
 
         self.section_hierarchy = (
             SectionHierarchyBuilder()
-        )
-
-        self.sort_order_assigner = (
-            SortOrderAssigner()
         )
 
         self.chunker = Chunker(
             max_length=chunk_max_length
         )
 
-        self.token_counter = TokenCounter()
+        self.sort_order_assigner = (
+            SortOrderAssigner()
+        )
+
+        self.token_counter = (
+            TokenCounter()
+        )
 
         # =====================
         # Output
         # =====================
 
         self.builder = JsonBuilder()
-        self.storage = PostgresStorage()
+
+        # PostgreSQL 必须延迟初始化。
+        #
+        # save_database=False 时：
+        #
+        #     - 不创建 PostgresStorage
+        #     - 不读取数据库 Secret
+        #     - 不触发数据库配置验证
+        self.storage: PostgresStorage | None = None
 
     def run(
         self,
@@ -211,179 +271,246 @@ class XLSXPipeline:
             output:
                 JSON 输出路径。
 
+                save_json=False 时，
+                不会读取或验证该路径。
+
         Returns:
-            解析、过滤、分块并完成 Token 统计后的 Document。
+            解析、过滤、分块并完成
+            Token 统计后的 Document。
         """
 
         input_path = self._validate_input_path(
             file_path
         )
 
-        output_path = Path(
-            output
-        ).expanduser()
+        # =====================
+        # 1. Load
+        # =====================
 
-        try:
-            # =====================
-            # 1. Load
-            # =====================
+        document = self.loader.load(
+            str(input_path)
+        )
 
-            document = self.loader.load(
-                str(input_path)
+        # =====================
+        # 2. Unicode Normalize
+        # =====================
+
+        document = (
+            self.unicode_normalizer.process(
+                document
             )
+        )
 
-            # =====================
-            # 2. Unicode Normalize
-            # =====================
+        # =====================
+        # 3. Sheet Filter
+        # =====================
 
-            document = (
-                self.unicode_normalizer.process(
-                    document
+        document = (
+            self.sheet_filter.filter(
+                document
+            )
+        )
+
+        # =====================
+        # 4. Row Filter
+        # =====================
+
+        document = (
+            self.row_filter.filter(
+                document
+            )
+        )
+
+        # =====================
+        # 5. Parse
+        # =====================
+
+        document = self.parser.parse(
+            document
+        )
+
+        # =====================
+        # 6. Deduplicate
+        # =====================
+
+        document = (
+            self.deduplicator.process(
+                document
+            )
+        )
+
+        # =====================
+        # 7. Section Hierarchy
+        # =====================
+
+        document = (
+            self.section_hierarchy.process(
+                document
+            )
+        )
+
+        # =====================
+        # 8. Content Filter
+        # =====================
+
+        document = (
+            self.content_filter.filter(
+                document
+            )
+        )
+
+        # =====================
+        # 9. Chunk
+        # =====================
+
+        document = (
+            self.chunker.process(
+                document
+            )
+        )
+
+        # =====================
+        # 10. Sort Order
+        # =====================
+        #
+        # SortOrderAssigner 必须放在 Chunker 后。
+        #
+        # 一个 XLSX 数据行生成的 Content
+        # 可能因为文本过长而被拆成：
+        #
+        #     Content 1
+        #         -> Chunk 1
+        #         -> Chunk 2
+        #
+        #     Content 2
+        #         -> Chunk 1
+        #         -> Chunk 2
+        #
+        # 最终 chunk_index 应针对最终 Content
+        # 集合统一分配，而不是在拆分前分配。
+
+        document = (
+            self.sort_order_assigner.process(
+                document
+            )
+        )
+
+        # =====================
+        # 11. Token Count
+        # =====================
+
+        document = (
+            self.token_counter.process(
+                document
+            )
+        )
+
+        # =====================
+        # 12. Metadata
+        # =====================
+
+        document.metadata.update(
+            {
+                "pipeline": "XLSXPipeline",
+                "pipeline_status": "SUCCESS",
+                "chapter_count": len(
+                    document.chapters
+                ),
+                "section_count": len(
+                    document.sections
+                ),
+                "content_count": len(
+                    document.contents
+                ),
+                "page_count": len(
+                    document.pages
+                ),
+                "block_count": len(
+                    document.blocks
+                ),
+                "save_json": (
+                    self.save_json_enabled
+                ),
+                "save_database": (
+                    self.save_database_enabled
+                ),
+            }
+        )
+
+        # =====================
+        # 13. JSON
+        # =====================
+
+        if self.save_json_enabled:
+            output_path = (
+                self._validate_output_path(
+                    output
                 )
             )
 
-            # =====================
-            # 3. Sheet Filter
-            # =====================
+            output_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
-            document = self.sheet_filter.filter(
+            json_data = self.builder.build(
                 document
             )
 
-            # =====================
-            # 4. Row Filter
-            # =====================
+            self.builder.save(
+                json_data,
+                str(output_path),
+            )
 
-            document = self.row_filter.filter(
+        # =====================
+        # 14. PostgreSQL
+        # =====================
+
+        if self.save_database_enabled:
+            storage = self._get_storage()
+
+            storage.save(
                 document
             )
 
-            # =====================
-            # 5. Parse
-            # =====================
+        return document
 
-            document = self.parser.parse(
-                document
+    def _get_storage(
+        self,
+    ) -> PostgresStorage:
+        """
+        延迟创建 PostgreSQL Storage。
+
+        只有真正执行：
+
+            save_database=True
+
+        的数据库保存阶段时才初始化。
+        """
+
+        if self.storage is None:
+            self.storage = (
+                PostgresStorage()
             )
 
-            # =====================
-            # 6. Deduplicate
-            # =====================
-
-            document = self.deduplicator.process(
-                document
-            )
-
-            # =====================
-            # 7. Section Hierarchy
-            # =====================
-
-            document = (
-                self.section_hierarchy.process(
-                    document
-                )
-            )
-
-            # =====================
-            # 8. Sort Order
-            # =====================
-
-            document = (
-                self.sort_order_assigner.process(
-                    document
-                )
-            )
-
-            # =====================
-            # 9. Content Filter
-            # =====================
-
-            document = self.content_filter.filter(
-                document
-            )
-
-            # =====================
-            # 10. Chunk
-            # =====================
-
-            document = self.chunker.process(
-                document
-            )
-
-            # =====================
-            # 11. Token Count
-            # =====================
-
-            document = self.token_counter.process(
-                document
-            )
-
-            # =====================
-            # 12. Metadata
-            # =====================
-
-            document.metadata.update(
-                {
-                    "pipeline": "XLSXPipeline",
-                    "pipeline_status": "SUCCESS",
-                    "chapter_count": len(
-                        document.chapters
-                    ),
-                    "section_count": len(
-                        document.sections
-                    ),
-                    "content_count": len(
-                        document.contents
-                    ),
-                    "page_count": len(
-                        document.pages
-                    ),
-                    "block_count": len(
-                        document.blocks
-                    ),
-                }
-            )
-
-            # =====================
-            # 13. JSON
-            # =====================
-
-            if self.save_json_enabled:
-                output_path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                json_data = self.builder.build(
-                    document
-                )
-
-                self.builder.save(
-                    json_data,
-                    str(output_path),
-                )
-
-            # =====================
-            # 14. PostgreSQL
-            # =====================
-
-            if self.save_database_enabled:
-                self.storage.save(
-                    document
-                )
-
-            return document
-
-        except Exception as exc:
-            raise RuntimeError(
-                f"XLSX pipeline failed for "
-                f"'{input_path.name}': {exc}"
-            ) from exc
+        return self.storage
 
     @staticmethod
     def _validate_input_path(
         file_path: str | Path,
     ) -> Path:
+
+        if file_path is None:
+            raise ValueError(
+                "file_path cannot be None."
+            )
+
+        if not str(
+            file_path
+        ).strip():
+            raise ValueError(
+                "file_path cannot be empty."
+            )
 
         path = Path(
             file_path
@@ -399,17 +526,44 @@ class XLSXPipeline:
                 f"Input path is not a file: {path}"
             )
 
-        if path.name.startswith("~$"):
+        if path.name.startswith(
+            "~$"
+        ):
             raise ValueError(
-                "Temporary Excel file is not supported: "
+                "Temporary Excel file "
+                "is not supported: "
                 f"{path.name}"
             )
 
         if path.suffix.lower() != ".xlsx":
             raise ValueError(
-                "XLSXPipeline only accepts .xlsx files. "
+                "XLSXPipeline only accepts "
+                ".xlsx files. "
                 f"Received: "
                 f"{path.suffix or '<no extension>'}"
             )
 
         return path
+
+    @staticmethod
+    def _validate_output_path(
+        output: str | Path,
+    ) -> Path:
+
+        if output is None:
+            raise ValueError(
+                "output cannot be None when "
+                "save_json=True."
+            )
+
+        if not str(
+            output
+        ).strip():
+            raise ValueError(
+                "output cannot be empty when "
+                "save_json=True."
+            )
+
+        return Path(
+            output
+        ).expanduser()

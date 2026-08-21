@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Sequence
+from uuid import UUID
 
 from qdrant_client import (
     QdrantClient,
@@ -11,6 +13,7 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    FilterSelector,
     MatchValue,
     PointStruct,
     VectorParams,
@@ -89,22 +92,18 @@ class QdrantVectorStore(
             )
         )
 
-        if dimension <= 0:
-            raise VectorStoreValidationError(
-                "dimension must be greater than 0."
+        self.dimension = (
+            self._normalize_positive_int(
+                dimension,
+                field_name="dimension",
             )
-
-        if timeout <= 0:
-            raise VectorStoreValidationError(
-                "timeout must be greater than 0."
-            )
-
-        self.dimension = int(
-            dimension
         )
 
-        self.timeout = int(
-            timeout
+        self.timeout = (
+            self._normalize_positive_int(
+                timeout,
+                field_name="timeout",
+            )
         )
 
         try:
@@ -367,17 +366,19 @@ class QdrantVectorStore(
                 collection_name=(
                     self.collection_name
                 ),
-                points_selector=Filter(
-                    must=[
-                        FieldCondition(
-                            key="document_id",
-                            match=MatchValue(
-                                value=(
-                                    normalized_document_id
-                                )
-                            ),
-                        )
-                    ]
+                points_selector=FilterSelector(
+                    filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="document_id",
+                                match=MatchValue(
+                                    value=(
+                                        normalized_document_id
+                                    )
+                                ),
+                            )
+                        ]
+                    )
                 ),
                 wait=True,
             )
@@ -432,15 +433,16 @@ class QdrantVectorStore(
         self,
     ) -> None:
         """
-        防止 Collection 已存在，
-        但 Vector Dimension 与当前模型不一致。
+        验证已存在 Collection 与当前配置兼容。
 
-        例如：
+        当前 QdrantVectorStore 使用：
 
-            Collection = 768维
-            BGE-M3     = 1024维
+            unnamed dense vector
+            COSINE distance
+            self.dimension dimensions
 
-        此时禁止继续写入。
+        如果 Collection 已存在但配置不一致，
+        禁止继续写入或检索。
         """
 
         try:
@@ -465,18 +467,40 @@ class QdrantVectorStore(
             .vectors
         )
 
+        # 当前实现只支持单个 unnamed dense vector。
+        #
+        # Named vectors 的 Qdrant 配置通常表现为：
+        #
+        #     dict[str, VectorParams]
+        #
+        # 不能误当作单 VectorParams 使用。
+        if isinstance(
+            vectors_config,
+            dict,
+        ):
+            raise QdrantVectorStoreError(
+                "Qdrant collection uses named vectors, "
+                "but QdrantVectorStore currently expects "
+                "a single unnamed dense vector. "
+                f"collection={self.collection_name}"
+            )
+
         actual_dimension = getattr(
             vectors_config,
             "size",
             None,
         )
 
-        if (
-            actual_dimension is not None
-            and int(
-                actual_dimension
-            ) != self.dimension
-        ):
+        if actual_dimension is None:
+            raise QdrantVectorStoreError(
+                "Unable to determine Qdrant collection "
+                "vector dimension. "
+                f"collection={self.collection_name}"
+            )
+
+        if int(
+            actual_dimension
+        ) != self.dimension:
             raise QdrantVectorStoreError(
                 "Qdrant collection vector "
                 "dimension mismatch. "
@@ -484,6 +508,29 @@ class QdrantVectorStore(
                 f"{self.collection_name}, "
                 f"expected={self.dimension}, "
                 f"actual={actual_dimension}"
+            )
+
+        actual_distance = getattr(
+            vectors_config,
+            "distance",
+            None,
+        )
+
+        if actual_distance is None:
+            raise QdrantVectorStoreError(
+                "Unable to determine Qdrant collection "
+                "distance metric. "
+                f"collection={self.collection_name}"
+            )
+
+        if not self._is_cosine_distance(
+            actual_distance
+        ):
+            raise QdrantVectorStoreError(
+                "Qdrant collection distance mismatch. "
+                f"collection={self.collection_name}, "
+                f"expected={Distance.COSINE}, "
+                f"actual={actual_distance}"
             )
 
     # ==================================================
@@ -500,6 +547,15 @@ class QdrantVectorStore(
         if records is None:
             raise VectorStoreValidationError(
                 "records cannot be None."
+            )
+
+        if isinstance(
+            records,
+            (str, bytes),
+        ):
+            raise VectorStoreValidationError(
+                "records must be a sequence "
+                "of VectorRecord objects."
             )
 
         normalized: list[
@@ -522,11 +578,23 @@ class QdrantVectorStore(
                     f"at index {index}."
                 )
 
-            if record.id in seen_ids:
-                continue
+            normalized_id = (
+                self._validate_point_id(
+                    record.id
+                )
+            )
 
-            self._validate_vector(
-                record.vector
+            if normalized_id in seen_ids:
+                raise VectorStoreValidationError(
+                    "Duplicate VectorRecord id "
+                    f"in the same upsert batch: "
+                    f"{normalized_id}"
+                )
+
+            normalized_vector = (
+                self._validate_vector(
+                    record.vector
+                )
             )
 
             if not isinstance(
@@ -539,11 +607,21 @@ class QdrantVectorStore(
                 )
 
             seen_ids.add(
-                record.id
+                normalized_id
             )
 
+            # VectorRecord 是 frozen dataclass。
+            #
+            # 如果 ID 或 vector 经规范化，
+            # 创建新的标准记录，不修改调用方对象。
             normalized.append(
-                record
+                VectorRecord(
+                    id=normalized_id,
+                    vector=normalized_vector,
+                    payload=dict(
+                        record.payload
+                    ),
+                )
             )
 
         return normalized
@@ -556,6 +634,15 @@ class QdrantVectorStore(
         if vector is None:
             raise VectorStoreValidationError(
                 "vector cannot be None."
+            )
+
+        if isinstance(
+            vector,
+            (str, bytes),
+        ):
+            raise VectorStoreValidationError(
+                "vector must be a sequence "
+                "of numeric values."
             )
 
         try:
@@ -583,7 +670,146 @@ class QdrantVectorStore(
                 f"actual={len(normalized)}"
             )
 
+        if not all(
+            math.isfinite(value)
+            for value in normalized
+        ):
+            raise VectorStoreValidationError(
+                "vector cannot contain "
+                "NaN or infinite values."
+            )
+
         return normalized
+
+    @staticmethod
+    def _validate_point_id(
+        point_id: int | str,
+    ) -> int | str:
+        """
+        验证 Qdrant Point ID。
+
+        Qdrant Point ID 使用：
+
+            unsigned 64-bit integer
+            或 UUID string
+
+        不接受任意业务字符串。
+
+        EmbeddingRecord / Content 的业务 ID
+        如果不是 UUID，需要在 Adapter 层转换为稳定 UUID，
+        不在 VectorStore 中静默重写。
+        """
+
+        if isinstance(
+            point_id,
+            bool,
+        ):
+            raise VectorStoreValidationError(
+                "VectorRecord id cannot be bool."
+            )
+
+        if isinstance(
+            point_id,
+            int,
+        ):
+            if (
+                point_id < 0
+                or point_id
+                > 18_446_744_073_709_551_615
+            ):
+                raise VectorStoreValidationError(
+                    "Integer VectorRecord id must be "
+                    "within unsigned 64-bit range."
+                )
+
+            return point_id
+
+        if isinstance(
+            point_id,
+            str,
+        ):
+            normalized = point_id.strip()
+
+            if not normalized:
+                raise VectorStoreValidationError(
+                    "VectorRecord id cannot be empty."
+                )
+
+            try:
+                parsed = UUID(
+                    normalized
+                )
+
+            except ValueError as exc:
+                raise VectorStoreValidationError(
+                    "String VectorRecord id must be "
+                    "a valid UUID for Qdrant. "
+                    f"Received: {normalized!r}"
+                ) from exc
+
+            return str(
+                parsed
+            )
+
+        raise VectorStoreValidationError(
+            "VectorRecord id must be "
+            "an int or UUID string."
+        )
+
+    @staticmethod
+    def _is_cosine_distance(
+        distance: object,
+    ) -> bool:
+        """
+        兼容 Qdrant enum / string 表示。
+        """
+
+        if distance == Distance.COSINE:
+            return True
+
+        value = getattr(
+            distance,
+            "value",
+            distance,
+        )
+
+        return str(
+            value
+        ).strip().lower() == "cosine"
+
+    @staticmethod
+    def _normalize_positive_int(
+        value: int,
+        *,
+        field_name: str,
+    ) -> int:
+        """
+        严格校验正整数配置。
+
+        防止：
+
+            1024.5 -> int(...) -> 1024
+
+        这类静默截断。
+        """
+
+        if (
+            isinstance(value, bool)
+            or not isinstance(
+                value,
+                int,
+            )
+        ):
+            raise VectorStoreValidationError(
+                f"{field_name} must be an integer."
+            )
+
+        if value <= 0:
+            raise VectorStoreValidationError(
+                f"{field_name} must be greater than 0."
+            )
+
+        return value
 
     @staticmethod
     def _normalize_required_string(

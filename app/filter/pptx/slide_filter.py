@@ -4,13 +4,15 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-from app.model.block import DocumentBlock
+from app.model.block import BlockType, DocumentBlock
 from app.model.document import Document
 from app.model.page import Page
 
 
 class SlideFilterError(RuntimeError):
-    """PPTX Slide 过滤异常。"""
+    """
+    PPTX Slide 过滤异常。
+    """
 
 
 class SlideFilter:
@@ -22,13 +24,16 @@ class SlideFilter:
         - 删除空 Slide
         - 删除 Block 数过少的 Slide
         - 删除文本长度过短的 Slide
-        - 根据标题白名单/黑名单过滤 Slide
+        - 根据 Slide 编号白名单 / 黑名单过滤
+        - 根据标题白名单 / 黑名单过滤
         - 根据标题正则排除封面、目录、修订履历等页面
-        - 删除对应 DocumentBlock
+        - 删除被过滤 Slide 对应的 DocumentBlock
         - 重建逻辑 Page
         - 重新分配 Block order
         - 修正 Block page_number
+        - 保留原始 slide_index / slide_number
         - 更新 document.metadata["slides"]
+        - 保持 metadata 统计可重复执行
 
     不负责：
         - Shape 内容清洗
@@ -38,6 +43,10 @@ class SlideFilter:
         - Chunk
         - Token 统计
     """
+
+    # ==================================================
+    # Default Excluded Titles
+    # ==================================================
 
     DEFAULT_EXCLUDED_TITLE_PATTERNS = (
         re.compile(
@@ -62,6 +71,10 @@ class SlideFilter:
             re.IGNORECASE,
         ),
     )
+
+    # ==================================================
+    # Constructor
+    # ==================================================
 
     def __init__(
         self,
@@ -128,7 +141,8 @@ class SlideFilter:
 
         self.include_slide_numbers = {
             int(value)
-            for value in (
+            for value
+            in (
                 include_slide_numbers
                 or []
             )
@@ -136,7 +150,8 @@ class SlideFilter:
 
         self.exclude_slide_numbers = {
             int(value)
-            for value in (
+            for value
+            in (
                 exclude_slide_numbers
                 or []
             )
@@ -164,6 +179,7 @@ class SlideFilter:
             )
 
         if exclude_title_patterns:
+
             flags = (
                 0
                 if case_sensitive
@@ -171,6 +187,7 @@ class SlideFilter:
             )
 
             for pattern in exclude_title_patterns:
+
                 if isinstance(
                     pattern,
                     re.Pattern,
@@ -178,10 +195,13 @@ class SlideFilter:
                     patterns.append(
                         pattern
                     )
+
                 else:
                     patterns.append(
                         re.compile(
-                            str(pattern),
+                            str(
+                                pattern
+                            ),
                             flags,
                         )
                     )
@@ -189,6 +209,10 @@ class SlideFilter:
         self.exclude_title_patterns = tuple(
             patterns
         )
+
+    # ==================================================
+    # Public API
+    # ==================================================
 
     def filter(
         self,
@@ -200,11 +224,20 @@ class SlideFilter:
         )
 
         try:
+
+            # ==========================================
+            # Collect Slide Records
+            # ==========================================
+
             slide_records = (
                 self._collect_slide_records(
                     document
                 )
             )
+
+            # ==========================================
+            # Group Blocks
+            # ==========================================
 
             blocks_by_slide = (
                 self._group_blocks_by_slide(
@@ -220,9 +253,16 @@ class SlideFilter:
                 dict[str, Any]
             ] = []
 
+            # ==========================================
+            # Filter Slides
+            # ==========================================
+
             for record in slide_records:
+
                 slide_index = int(
-                    record["slide_index"]
+                    record[
+                        "slide_index"
+                    ]
                 )
 
                 slide_blocks = (
@@ -240,36 +280,44 @@ class SlideFilter:
                 )
 
                 if keep:
+
                     retained_slide_indexes.add(
                         slide_index
                     )
 
-                else:
-                    removed_slides.append(
-                        {
-                            "slide_index": (
-                                slide_index
-                            ),
-                            "slide_number": (
-                                record.get(
-                                    "slide_number",
-                                    slide_index + 1,
-                                )
-                            ),
-                            "title": (
-                                record.get(
-                                    "title"
-                                )
-                            ),
-                            "hidden": bool(
-                                record.get(
-                                    "hidden",
-                                    False,
-                                )
-                            ),
-                            "reason": reason,
-                        }
-                    )
+                    continue
+
+                removed_slides.append(
+                    {
+                        "slide_index": (
+                            slide_index
+                        ),
+                        "slide_number": (
+                            record.get(
+                                "slide_number",
+                                slide_index + 1,
+                            )
+                        ),
+                        "title": (
+                            record.get(
+                                "title"
+                            )
+                        ),
+                        "hidden": bool(
+                            record.get(
+                                "hidden",
+                                False,
+                            )
+                        ),
+                        "reason": (
+                            reason
+                        ),
+                    }
+                )
+
+            # ==========================================
+            # Filter Blocks
+            # ==========================================
 
             original_block_count = len(
                 document.blocks
@@ -277,35 +325,60 @@ class SlideFilter:
 
             document.blocks = [
                 block
-                for block in document.blocks
+                for block
+                in document.blocks
                 if self._block_is_retained(
                     block=block,
                     retained_slide_indexes=(
                         retained_slide_indexes
                     ),
+                    retain_without_metadata=(
+                        self.retain_slides_without_metadata
+                    ),
                 )
             ]
 
+            # ==========================================
+            # Block Order
+            # ==========================================
+
             if self.reassign_block_order:
+
                 self._reassign_block_order(
                     document
                 )
 
+            # ==========================================
+            # Rebuild Pages
+            # ==========================================
+
             if self.rebuild_pages:
+
                 self._rebuild_pages(
                     document=document,
                     retained_slide_indexes=(
                         retained_slide_indexes
                     ),
-                    slide_records=slide_records,
+                    slide_records=(
+                        slide_records
+                    ),
                 )
+
+            # ==========================================
+            # Metadata
+            # ==========================================
 
             self._update_slide_metadata(
                 document=document,
                 retained_slide_indexes=(
                     retained_slide_indexes
                 ),
-                removed_slides=removed_slides,
+                removed_slides=(
+                    removed_slides
+                ),
+                slide_records=(
+                    slide_records
+                ),
             )
 
             document.metadata.update(
@@ -317,7 +390,9 @@ class SlideFilter:
                         "SUCCESS"
                     ),
                     "slide_filter_original_count": (
-                        len(slide_records)
+                        len(
+                            slide_records
+                        )
                     ),
                     "slide_filter_retained_count": (
                         len(
@@ -325,11 +400,15 @@ class SlideFilter:
                         )
                     ),
                     "slide_filter_removed_count": (
-                        len(removed_slides)
+                        len(
+                            removed_slides
+                        )
                     ),
                     "slide_filter_removed_block_count": (
                         original_block_count
-                        - len(document.blocks)
+                        - len(
+                            document.blocks
+                        )
                     ),
                     "slide_filter_removed_slides": (
                         removed_slides
@@ -339,17 +418,28 @@ class SlideFilter:
 
             return document
 
+        except SlideFilterError:
+            raise
+
         except Exception as exc:
             raise SlideFilterError(
-                f"Failed to filter PPTX slides: {exc}"
+                "Failed to filter PPTX "
+                f"slides: {exc}"
             ) from exc
+
+    # ==================================================
+    # Slide Decision
+    # ==================================================
 
     def _should_keep_slide(
         self,
         *,
         record: dict[str, Any],
         blocks: list[DocumentBlock],
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[
+        bool,
+        str | None,
+    ]:
 
         slide_index = int(
             record.get(
@@ -395,12 +485,13 @@ class SlideFilter:
                     block.text
                 )
             )
-            for block in blocks
+            for block
+            in blocks
         )
 
-        # =====================
-        # Explicit include
-        # =====================
+        # ==============================================
+        # Include Slide Numbers
+        # ==============================================
 
         if (
             self.include_slide_numbers
@@ -412,6 +503,10 @@ class SlideFilter:
                 "not_in_slide_number_include_list",
             )
 
+        # ==============================================
+        # Include Titles
+        # ==============================================
+
         if (
             self.include_titles
             and normalized_title
@@ -422,9 +517,9 @@ class SlideFilter:
                 "not_in_title_include_list",
             )
 
-        # =====================
-        # Explicit exclude
-        # =====================
+        # ==============================================
+        # Exclude Slide Numbers
+        # ==============================================
 
         if (
             slide_number
@@ -435,6 +530,10 @@ class SlideFilter:
                 "excluded_slide_number",
             )
 
+        # ==============================================
+        # Exclude Titles
+        # ==============================================
+
         if (
             normalized_title
             in self.exclude_titles
@@ -444,9 +543,9 @@ class SlideFilter:
                 "excluded_slide_title",
             )
 
-        # =====================
-        # Hidden
-        # =====================
+        # ==============================================
+        # Hidden Slide
+        # ==============================================
 
         if (
             hidden
@@ -457,9 +556,9 @@ class SlideFilter:
                 "hidden_slide",
             )
 
-        # =====================
-        # Empty / insufficient
-        # =====================
+        # ==============================================
+        # Empty Slide
+        # ==============================================
 
         if (
             self.remove_empty_slides
@@ -470,6 +569,10 @@ class SlideFilter:
                 "empty_slide",
             )
 
+        # ==============================================
+        # Minimum Block Count
+        # ==============================================
+
         if (
             block_count
             < self.minimum_block_count
@@ -478,6 +581,10 @@ class SlideFilter:
                 False,
                 "insufficient_block_count",
             )
+
+        # ==============================================
+        # Minimum Text Length
+        # ==============================================
 
         if (
             text_length
@@ -488,9 +595,9 @@ class SlideFilter:
                 "insufficient_text_length",
             )
 
-        # =====================
-        # Title pattern
-        # =====================
+        # ==============================================
+        # Excluded Title Pattern
+        # ==============================================
 
         if (
             title
@@ -508,30 +615,56 @@ class SlideFilter:
             None,
         )
 
+    # ==================================================
+    # Collect Slide Records
+    # ==================================================
+
     def _collect_slide_records(
         self,
         document: Document,
-    ) -> list[dict[str, Any]]:
+    ) -> list[
+        dict[str, Any]
+    ]:
         """
-        优先从 metadata["slides"] 获取。
+        收集 Slide metadata。
 
-        metadata 不完整时，从 blocks 回退生成。
+        优先使用：
+
+            document.metadata["slides"]
+
+        同时使用：
+
+            document.blocks
+
+        补全 metadata 中缺失的 Slide。
+
+        这样 metadata["slides"] 即使不完整，
+        也不会导致合法 Block 被误删。
         """
 
-        raw_records = document.metadata.get(
-            "slides",
-            [],
+        raw_records = (
+            document.metadata.get(
+                "slides",
+                [],
+            )
         )
 
-        records: list[
-            dict[str, Any]
-        ] = []
+        record_map: dict[
+            int,
+            dict[str, Any],
+        ] = {}
+
+        # ==============================================
+        # Metadata Records
+        # ==============================================
 
         if isinstance(
             raw_records,
             list,
         ):
+
             for raw_record in raw_records:
+
                 if not isinstance(
                     raw_record,
                     dict,
@@ -544,14 +677,20 @@ class SlideFilter:
                 ):
                     continue
 
+                slide_index = int(
+                    raw_record[
+                        "slide_index"
+                    ]
+                )
+
                 record = dict(
                     raw_record
                 )
 
-                slide_index = int(
-                    record[
-                        "slide_index"
-                    ]
+                record[
+                    "slide_index"
+                ] = (
+                    slide_index
                 )
 
                 record.setdefault(
@@ -569,94 +708,170 @@ class SlideFilter:
                     False,
                 )
 
-                records.append(
-                    record
-                )
+                record_map[
+                    slide_index
+                ] = record
 
-        if records:
-            return sorted(
-                records,
-                key=lambda item: int(
-                    item["slide_index"]
-                ),
-            )
+        # ==============================================
+        # Current Block Statistics
+        # ==============================================
 
-        # =====================
-        # Fallback from blocks
-        # =====================
-
-        slide_map: dict[
+        block_counts: dict[
             int,
-            dict[str, Any],
+            int,
         ] = {}
 
-        for block in document.blocks:
-            metadata = block.metadata or {}
+        character_counts: dict[
+            int,
+            int,
+        ] = {}
 
-            slide_index = metadata.get(
-                "slide_index"
+        # ==============================================
+        # Supplement From Blocks
+        # ==============================================
+
+        for block in document.blocks:
+
+            metadata = (
+                block.metadata
+                or {}
+            )
+
+            slide_index = (
+                metadata.get(
+                    "slide_index"
+                )
             )
 
             if slide_index is None:
-                if block.page_number is None:
+
+                if (
+                    block.page_number
+                    is None
+                ):
                     continue
 
                 slide_index = (
-                    block.page_number - 1
+                    int(
+                        block.page_number
+                    )
+                    - 1
                 )
 
             slide_index = int(
                 slide_index
             )
 
-            record = slide_map.setdefault(
-                slide_index,
-                {
-                    "slide_index": (
-                        slide_index
-                    ),
-                    "slide_number": (
-                        slide_index + 1
-                    ),
-                    "title": None,
-                    "hidden": False,
-                    "block_count": 0,
-                    "character_count": 0,
-                },
+            record = (
+                record_map.setdefault(
+                    slide_index,
+                    {
+                        "slide_index": (
+                            slide_index
+                        ),
+                        "slide_number": (
+                            metadata.get(
+                                "slide_number",
+                                slide_index + 1,
+                            )
+                        ),
+                        "title": None,
+                        "hidden": False,
+                    },
+                )
             )
 
-            record[
-                "block_count"
-            ] += 1
-
-            record[
-                "character_count"
-            ] += len(
-                block.text or ""
+            block_counts[
+                slide_index
+            ] = (
+                block_counts.get(
+                    slide_index,
+                    0,
+                )
+                + 1
             )
 
+            character_counts[
+                slide_index
+            ] = (
+                character_counts.get(
+                    slide_index,
+                    0,
+                )
+                + len(
+                    block.text
+                    or ""
+                )
+            )
+
+            # Metadata 中没有标题时，
+            # 从一级 Heading Block 回退识别。
             if (
-                record["title"] is None
-                and block.block_type.value
-                == "heading"
+                not record.get(
+                    "title"
+                )
+                and block.block_type
+                == BlockType.HEADING
                 and block.level == 1
                 and block.text
             ):
                 record[
                     "title"
-                ] = block.text
+                ] = (
+                    block.text
+                )
+
+        # ==============================================
+        # Refresh Statistics
+        # ==============================================
+
+        for (
+            slide_index,
+            record,
+        ) in record_map.items():
+
+            record[
+                "block_count"
+            ] = (
+                block_counts.get(
+                    slide_index,
+                    0,
+                )
+            )
+
+            record[
+                "character_count"
+            ] = (
+                character_counts.get(
+                    slide_index,
+                    0,
+                )
+            )
 
         return [
-            slide_map[index]
-            for index in sorted(
-                slide_map
+            record_map[
+                slide_index
+            ]
+            for slide_index
+            in sorted(
+                record_map
             )
         ]
 
-    @staticmethod
+    # ==================================================
+    # Group Blocks By Slide
+    # ==================================================
+
+    @classmethod
     def _group_blocks_by_slide(
-        blocks: list[DocumentBlock],
-    ) -> dict[int, list[DocumentBlock]]:
+        cls,
+        blocks: list[
+            DocumentBlock
+        ],
+    ) -> dict[
+        int,
+        list[DocumentBlock],
+    ]:
 
         groups: dict[
             int,
@@ -664,23 +879,16 @@ class SlideFilter:
         ] = {}
 
         for block in blocks:
-            metadata = block.metadata or {}
 
-            slide_index = metadata.get(
-                "slide_index"
+            slide_index = (
+                cls._resolve_slide_index(
+                    block,
+                    allow_missing=True,
+                )
             )
 
             if slide_index is None:
-                if block.page_number is None:
-                    continue
-
-                slide_index = (
-                    block.page_number - 1
-                )
-
-            slide_index = int(
-                slide_index
-            )
+                continue
 
             groups.setdefault(
                 slide_index,
@@ -691,32 +899,86 @@ class SlideFilter:
 
         return groups
 
-    @staticmethod
+    # ==================================================
+    # Block Retention
+    # ==================================================
+
+    @classmethod
     def _block_is_retained(
+        cls,
         *,
         block: DocumentBlock,
         retained_slide_indexes: set[int],
+        retain_without_metadata: bool,
     ) -> bool:
 
-        metadata = block.metadata or {}
-
-        slide_index = metadata.get(
-            "slide_index"
+        slide_index = (
+            cls._resolve_slide_index(
+                block,
+                allow_missing=True,
+            )
         )
 
         if slide_index is None:
-            if block.page_number is None:
-                # 无 Slide 信息的 Block 默认保留，
-                # 防止误删未知来源数据。
-                return True
 
-            slide_index = (
-                block.page_number - 1
+            return bool(
+                retain_without_metadata
             )
 
-        return int(
+        return (
             slide_index
-        ) in retained_slide_indexes
+            in retained_slide_indexes
+        )
+
+    # ==================================================
+    # Resolve Slide Index
+    # ==================================================
+
+    @staticmethod
+    def _resolve_slide_index(
+        block: DocumentBlock,
+        *,
+        allow_missing: bool = False,
+    ) -> int | None:
+
+        metadata = (
+            block.metadata
+            or {}
+        )
+
+        slide_index = (
+            metadata.get(
+                "slide_index"
+            )
+        )
+
+        if slide_index is not None:
+
+            return int(
+                slide_index
+            )
+
+        if (
+            block.page_number
+            is not None
+        ):
+
+            return max(
+                int(
+                    block.page_number
+                )
+                - 1,
+                0,
+            )
+
+        if allow_missing:
+            return None
+
+        return 0
+
+    # ==================================================
+    # Reassign Block Order
+    # ==================================================
 
     @classmethod
     def _reassign_block_order(
@@ -729,9 +991,13 @@ class SlideFilter:
             key=cls._block_sort_key,
         )
 
-        for new_order, block in enumerate(
+        for (
+            new_order,
+            block,
+        ) in enumerate(
             sorted_blocks
         ):
+
             block.order = (
                 new_order
             )
@@ -740,20 +1006,31 @@ class SlideFilter:
             sorted_blocks
         )
 
+    # ==================================================
+    # Rebuild Pages
+    # ==================================================
+
     @classmethod
     def _rebuild_pages(
         cls,
         *,
         document: Document,
         retained_slide_indexes: set[int],
-        slide_records: list[dict[str, Any]],
+        slide_records: list[
+            dict[str, Any]
+        ],
     ) -> None:
         """
         每个保留 Slide 对应一个逻辑 Page。
 
-        注意：
-            Slide 原始编号保存在 metadata。
-            Page.page_number 重新连续编号。
+        page_number：
+            重新从 1 连续编号。
+
+        slide_index：
+            保留原始 0-based Slide Index。
+
+        slide_number：
+            保留原始 PowerPoint Slide Number。
         """
 
         blocks_by_slide = (
@@ -764,21 +1041,28 @@ class SlideFilter:
 
         record_map = {
             int(
-                record["slide_index"]
+                record[
+                    "slide_index"
+                ]
             ): record
-            for record in slide_records
+            for record
+            in slide_records
         }
 
         rebuilt_pages: list[
             Page
         ] = []
 
-        for logical_page_number, slide_index in enumerate(
+        for (
+            logical_page_number,
+            slide_index,
+        ) in enumerate(
             sorted(
                 retained_slide_indexes
             ),
             start=1,
         ):
+
             slide_blocks = sorted(
                 blocks_by_slide.get(
                     slide_index,
@@ -788,12 +1072,16 @@ class SlideFilter:
             )
 
             text = "\n".join(
-                block.text.strip()
-                for block in slide_blocks
-                if (
+                str(
                     block.text
-                    and block.text.strip()
-                )
+                    or ""
+                ).strip()
+                for block
+                in slide_blocks
+                if str(
+                    block.text
+                    or ""
+                ).strip()
             ).strip()
 
             rebuilt_pages.append(
@@ -805,8 +1093,10 @@ class SlideFilter:
                 )
             )
 
-            slide_record = record_map.get(
-                slide_index
+            slide_record = (
+                record_map.get(
+                    slide_index
+                )
             )
 
             original_slide_number = (
@@ -821,22 +1111,32 @@ class SlideFilter:
             )
 
             for block in slide_blocks:
+
                 block.page_number = (
                     logical_page_number
                 )
 
                 block.metadata.update(
                     {
-                        "logical_page_number": (
-                            logical_page_number
+                        "slide_index": (
+                            slide_index
                         ),
                         "slide_number": (
                             original_slide_number
                         ),
+                        "logical_page_number": (
+                            logical_page_number
+                        ),
                     }
                 )
 
-        document.pages = rebuilt_pages
+        document.pages = (
+            rebuilt_pages
+        )
+
+    # ==================================================
+    # Update Slide Metadata
+    # ==================================================
 
     @classmethod
     def _update_slide_metadata(
@@ -844,12 +1144,18 @@ class SlideFilter:
         *,
         document: Document,
         retained_slide_indexes: set[int],
-        removed_slides: list[dict[str, Any]],
+        removed_slides: list[
+            dict[str, Any]
+        ],
+        slide_records: list[
+            dict[str, Any]
+        ],
     ) -> None:
 
-        raw_records = document.metadata.get(
-            "slides",
-            [],
+        blocks_by_slide = (
+            cls._group_blocks_by_slide(
+                document.blocks
+            )
         )
 
         updated_records: list[
@@ -858,55 +1164,76 @@ class SlideFilter:
 
         logical_page_number = 1
 
-        if isinstance(
-            raw_records,
-            list,
-        ):
-            for record in raw_records:
-                if not isinstance(
-                    record,
-                    dict,
-                ):
-                    continue
-
-                slide_index = record.get(
+        for record in sorted(
+            slide_records,
+            key=lambda item: int(
+                item[
                     "slide_index"
+                ]
+            ),
+        ):
+
+            slide_index = int(
+                record[
+                    "slide_index"
+                ]
+            )
+
+            if (
+                slide_index
+                not in retained_slide_indexes
+            ):
+                continue
+
+            updated = dict(
+                record
+            )
+
+            slide_blocks = (
+                blocks_by_slide.get(
+                    slide_index,
+                    [],
                 )
+            )
 
-                if slide_index is None:
-                    continue
+            updated[
+                "logical_page_number"
+            ] = (
+                logical_page_number
+            )
 
-                slide_index = int(
-                    slide_index
+            updated[
+                "block_count"
+            ] = len(
+                slide_blocks
+            )
+
+            updated[
+                "character_count"
+            ] = sum(
+                len(
+                    block.text
+                    or ""
                 )
+                for block
+                in slide_blocks
+            )
 
-                if (
-                    slide_index
-                    not in retained_slide_indexes
-                ):
-                    continue
+            updated[
+                "status"
+            ] = "SUCCESS"
 
-                updated = dict(
-                    record
-                )
+            updated_records.append(
+                updated
+            )
 
-                updated[
-                    "logical_page_number"
-                ] = logical_page_number
-
-                updated[
-                    "status"
-                ] = "SUCCESS"
-
-                updated_records.append(
-                    updated
-                )
-
-                logical_page_number += 1
+            logical_page_number += 1
 
         document.metadata[
             "slides"
-        ] = updated_records
+        ] = (
+            updated_records
+        )
 
         document.metadata[
             "processed_slide_count"
@@ -914,16 +1241,47 @@ class SlideFilter:
             retained_slide_indexes
         )
 
+        # ==============================================
+        # Idempotent skipped_slide_count
+        # ==============================================
+        #
+        # 第一次：
+        #
+        #   loader skipped = 2
+        #   filter removed = 3
+        #   -> 5
+        #
+        # 第二次重复执行：
+        #
+        #   先减掉上一次 filter removed，
+        #   防止变成 8。
+
+        previous_removed_count = int(
+            document.metadata.get(
+                "slide_filter_removed_count",
+                0,
+            )
+            or 0
+        )
+
+        current_skipped_count = int(
+            document.metadata.get(
+                "skipped_slide_count",
+                0,
+            )
+            or 0
+        )
+
+        loader_skipped_count = max(
+            current_skipped_count
+            - previous_removed_count,
+            0,
+        )
+
         document.metadata[
             "skipped_slide_count"
         ] = (
-            int(
-                document.metadata.get(
-                    "skipped_slide_count",
-                    0,
-                )
-                or 0
-            )
+            loader_skipped_count
             + len(
                 removed_slides
             )
@@ -948,53 +1306,72 @@ class SlideFilter:
                 page.text
                 or ""
             )
-            for page in document.pages
+            for page
+            in document.pages
         )
 
-    @staticmethod
+    # ==================================================
+    # Sort Key
+    # ==================================================
+
+    @classmethod
     def _block_sort_key(
+        cls,
         block: DocumentBlock,
-    ) -> tuple[int, int, int, int]:
+    ) -> tuple[
+        int,
+        int,
+        int,
+        int,
+    ]:
 
-        metadata = block.metadata or {}
-
-        slide_index = int(
-            metadata.get(
-                "slide_index",
-                (
-                    block.page_number - 1
-                    if block.page_number
-                    is not None
-                    else 0
-                ),
-            )
+        metadata = (
+            block.metadata
+            or {}
         )
 
-        visual_index = int(
-            metadata.get(
-                "visual_index",
-                0,
+        slide_index = (
+            cls._resolve_slide_index(
+                block
             )
             or 0
         )
 
-        paragraph_index = int(
-            metadata.get(
-                "paragraph_index",
+        visual_index = (
+            cls._safe_int(
                 metadata.get(
-                    "table_row_index",
+                    "visual_index",
                     0,
                 ),
+                default=0,
             )
-            or 0
+        )
+
+        paragraph_or_row_index = (
+            cls._safe_int(
+                metadata.get(
+                    "paragraph_index",
+                    metadata.get(
+                        "table_row_index",
+                        0,
+                    ),
+                ),
+                default=0,
+            )
         )
 
         return (
             slide_index,
             visual_index,
-            paragraph_index,
-            block.order,
+            paragraph_or_row_index,
+            int(
+                block.order
+            ),
         )
+
+    # ==================================================
+    # Title Pattern
+    # ==================================================
 
     def _matches_excluded_title_pattern(
         self,
@@ -1010,6 +1387,10 @@ class SlideFilter:
             in self.exclude_title_patterns
         )
 
+    # ==================================================
+    # Normalize Set
+    # ==================================================
+
     def _normalize_text_set(
         self,
         values: Iterable[str] | None,
@@ -1018,15 +1399,29 @@ class SlideFilter:
         if values is None:
             return set()
 
-        return {
-            self._normalize_key(
-                value
+        normalized_values: set[
+            str
+        ] = set()
+
+        for value in values:
+
+            normalized = (
+                self._normalize_key(
+                    value
+                )
             )
-            for value in values
-            if self._normalize_text(
-                value
-            )
-        }
+
+            if normalized:
+
+                normalized_values.add(
+                    normalized
+                )
+
+        return normalized_values
+
+    # ==================================================
+    # Normalize Key
+    # ==================================================
 
     def _normalize_key(
         self,
@@ -1042,7 +1437,13 @@ class SlideFilter:
         if self.case_sensitive:
             return normalized
 
-        return normalized.casefold()
+        return (
+            normalized.casefold()
+        )
+
+    # ==================================================
+    # Normalize Text
+    # ==================================================
 
     @staticmethod
     def _normalize_text(
@@ -1056,31 +1457,70 @@ class SlideFilter:
             value
         )
 
-        normalized = normalized.replace(
-            "\u3000",
-            " ",
+        normalized = (
+            normalized.replace(
+                "\u3000",
+                " ",
+            )
         )
 
-        normalized = normalized.replace(
-            "\xa0",
-            " ",
+        normalized = (
+            normalized.replace(
+                "\xa0",
+                " ",
+            )
         )
 
-        normalized = normalized.replace(
+        for character in (
             "\u200b",
-            "",
-        )
-
-        normalized = normalized.replace(
+            "\u200c",
+            "\u200d",
+            "\u2060",
             "\ufeff",
-            "",
-        )
+        ):
+
+            normalized = (
+                normalized.replace(
+                    character,
+                    "",
+                )
+            )
 
         normalized = " ".join(
             normalized.split()
         )
 
-        return normalized.strip()
+        return (
+            normalized.strip()
+        )
+
+    # ==================================================
+    # Safe Int
+    # ==================================================
+
+    @staticmethod
+    def _safe_int(
+        value: Any,
+        *,
+        default: int = 0,
+    ) -> int:
+
+        try:
+
+            return int(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return default
+
+    # ==================================================
+    # Validation
+    # ==================================================
 
     @staticmethod
     def _validate_document(
@@ -1088,6 +1528,7 @@ class SlideFilter:
     ) -> None:
 
         if document is None:
+
             raise ValueError(
                 "Document cannot be None."
             )
@@ -1096,14 +1537,23 @@ class SlideFilter:
             document,
             Document,
         ):
+
             raise TypeError(
                 "SlideFilter expects an "
-                "app.model.document.Document instance."
+                "app.model.document.Document "
+                "instance."
             )
 
-        if document.file_type.lower() != "pptx":
+        file_type = str(
+            document.file_type
+            or ""
+        ).strip().lower()
+
+        if file_type != "pptx":
+
             raise ValueError(
-                "SlideFilter only accepts PPTX documents. "
+                "SlideFilter only accepts "
+                "PPTX documents. "
                 f"Received file_type: "
                 f"{document.file_type}"
             )

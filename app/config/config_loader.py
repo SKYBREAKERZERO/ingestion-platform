@@ -9,6 +9,11 @@ from typing import Any
 import yaml
 
 
+# ============================================================
+# Exceptions
+# ============================================================
+
+
 class ConfigurationError(RuntimeError):
     """应用配置基础异常。"""
 
@@ -23,6 +28,11 @@ class ConfigurationValidationError(
     ConfigurationError
 ):
     """配置内容校验失败。"""
+
+
+# ============================================================
+# Config Models
+# ============================================================
 
 
 @dataclass(frozen=True)
@@ -80,9 +90,7 @@ class LoggingConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
-    """
-    应用完整配置。
-    """
+    """应用完整配置。"""
 
     application: ApplicationConfig
     runtime: RuntimeConfig
@@ -90,6 +98,11 @@ class AppConfig:
     database: DatabaseConfig
     chunk: ChunkConfig
     logging: LoggingConfig
+
+
+# ============================================================
+# Config Loader
+# ============================================================
 
 
 class ConfigLoader:
@@ -104,14 +117,27 @@ class ConfigLoader:
         5. 返回强类型 AppConfig
 
     支持：
-        开发环境
-        PyInstaller EXE
+        - Python 开发环境
+        - PyInstaller OneDir
+        - PyInstaller OneFile
+
+    PyInstaller 路径设计：
+
+        get_application_directory()
+            -> EXE 所在目录
+            -> 用于 output / logs 等运行时可写目录
+
+        get_resource_directory()
+            -> sys._MEIPASS
+            -> 用于读取打包进 EXE 的 config.yaml 等只读资源
     """
 
     DEFAULT_CONFIG_RELATIVE_PATH = (
         Path("config")
         / "config.yaml"
     )
+
+    CONFIG_FILE_ENV = "CONFIG_FILE"
 
     VALID_LOG_LEVELS = {
         "DEBUG",
@@ -120,6 +146,10 @@ class ConfigLoader:
         "ERROR",
         "CRITICAL",
     }
+
+    # ========================================================
+    # Public API
+    # ========================================================
 
     @classmethod
     def load(
@@ -158,56 +188,98 @@ class ConfigLoader:
         获取配置文件路径。
 
         优先级：
+
             1. 显式 config_path
             2. CONFIG_FILE 环境变量
-            3. 应用目录/config/config.yaml
+            3. PyInstaller 内嵌资源目录/config/config.yaml
+            4. EXE 所在目录/config/config.yaml（fallback）
+            5. Python 项目根目录/config/config.yaml
+
+        OneFile 正常情况下使用第 3 项。
+        第 4 项仅作为外部配置 fallback，不要求最终发行目录存在该文件。
         """
 
+        # =====================
+        # 1. Explicit Path
+        # =====================
+
         if config_path is not None:
-            path = Path(
-                config_path
-            ).expanduser()
+            path = cls._normalize_path_input(
+                config_path,
+                field_name="config_path",
+            )
 
             return cls._validate_config_path(
                 path
             )
+
+        # =====================
+        # 2. Environment Path
+        # =====================
 
         environment_path = os.getenv(
-            "CONFIG_FILE"
+            cls.CONFIG_FILE_ENV
         )
 
-        if environment_path:
-            path = Path(
-                environment_path
-            ).expanduser()
+        if (
+            environment_path is not None
+            and environment_path.strip()
+        ):
+            path = cls._normalize_path_input(
+                environment_path,
+                field_name=(
+                    cls.CONFIG_FILE_ENV
+                ),
+            )
 
             return cls._validate_config_path(
                 path
             )
 
-        base_directory = (
-            cls.get_application_directory()
+        # =====================
+        # 3+. Default Candidates
+        # =====================
+
+        candidates = (
+            cls._get_default_config_candidates()
         )
 
-        path = (
-            base_directory
-            / cls.DEFAULT_CONFIG_RELATIVE_PATH
+        for candidate in candidates:
+            if (
+                candidate.exists()
+                and candidate.is_file()
+            ):
+                return cls._validate_config_path(
+                    candidate
+                )
+
+        searched_paths = "\n".join(
+            f"  - {candidate.resolve()}"
+            for candidate in candidates
         )
 
-        return cls._validate_config_path(
-            path
+        raise ConfigurationFileNotFoundError(
+            "Configuration file not found. "
+            "Searched paths:\n"
+            f"{searched_paths}"
         )
 
     @staticmethod
     def get_application_directory() -> Path:
         """
-        获取程序运行目录。
+        获取应用运行目录。
 
-        开发环境：
-            项目根目录
+        Python:
+            项目根目录。
 
-        PyInstaller：
-            EXE 所在目录
+        PyInstaller:
+            EXE 所在目录。
+
+        用途：
+            input/
+            output/
+            logs/
+            以及其他运行时可写文件。
         """
 
         if getattr(
@@ -224,6 +296,139 @@ class ConfigLoader:
         ).resolve().parents[2]
 
     @staticmethod
+    def get_resource_directory() -> Path:
+        """
+        获取只读资源目录。
+
+        Python:
+            项目根目录。
+
+        PyInstaller OneFile / OneDir:
+            PyInstaller 资源目录 sys._MEIPASS。
+
+        用途：
+            config/config.yaml
+            以及其他打包进 EXE 的静态资源。
+        """
+
+        if getattr(
+            sys,
+            "frozen",
+            False,
+        ):
+            meipass = getattr(
+                sys,
+                "_MEIPASS",
+                None,
+            )
+
+            if meipass:
+                return Path(
+                    meipass
+                ).resolve()
+
+        return Path(
+            __file__
+        ).resolve().parents[2]
+
+    # ========================================================
+    # Config Path
+    # ========================================================
+
+    @classmethod
+    def _get_default_config_candidates(
+        cls,
+    ) -> list[Path]:
+        """
+        返回默认配置候选路径。
+
+        冻结环境：
+            1. sys._MEIPASS/config/config.yaml
+            2. EXE目录/config/config.yaml
+
+        开发环境：
+            1. 项目根目录/config/config.yaml
+
+        保持顺序且自动去重。
+        """
+
+        candidates = [
+            (
+                cls.get_resource_directory()
+                / cls.DEFAULT_CONFIG_RELATIVE_PATH
+            )
+        ]
+
+        if getattr(
+            sys,
+            "frozen",
+            False,
+        ):
+            candidates.append(
+                (
+                    cls.get_application_directory()
+                    / cls.DEFAULT_CONFIG_RELATIVE_PATH
+                )
+            )
+
+        result: list[Path] = []
+        seen: set[str] = set()
+
+        for candidate in candidates:
+            key = str(
+                candidate.resolve()
+            ).casefold()
+
+            if key in seen:
+                continue
+
+            seen.add(
+                key
+            )
+
+            result.append(
+                candidate
+            )
+
+        return result
+
+    @staticmethod
+    def _normalize_path_input(
+        value: str | Path,
+        *,
+        field_name: str,
+    ) -> Path:
+        """
+        标准化配置路径输入。
+        """
+
+        if isinstance(
+            value,
+            Path,
+        ):
+            return value.expanduser()
+
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise ConfigurationValidationError(
+                f"{field_name} must be a "
+                "string or Path."
+            )
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ConfigurationValidationError(
+                f"{field_name} cannot be empty."
+            )
+
+        return Path(
+            normalized
+        ).expanduser()
+
+    @staticmethod
     def _validate_config_path(
         path: Path,
     ) -> Path:
@@ -231,9 +436,16 @@ class ConfigLoader:
         校验配置文件路径。
         """
 
-        resolved_path = (
-            path.resolve()
-        )
+        try:
+            resolved_path = (
+                path.resolve()
+            )
+
+        except OSError as exc:
+            raise ConfigurationValidationError(
+                "Unable to resolve "
+                f"configuration path: {path}"
+            ) from exc
 
         if not resolved_path.exists():
             raise (
@@ -262,6 +474,10 @@ class ConfigLoader:
 
         return resolved_path
 
+    # ========================================================
+    # YAML
+    # ========================================================
+
     @staticmethod
     def _load_yaml(
         path: Path,
@@ -285,6 +501,12 @@ class ConfigLoader:
                 f"configuration: {exc}"
             ) from exc
 
+        except UnicodeError as exc:
+            raise ConfigurationError(
+                "Configuration file must "
+                f"be valid UTF-8: {path}"
+            ) from exc
+
         except OSError as exc:
             raise ConfigurationError(
                 "Failed to read "
@@ -306,6 +528,10 @@ class ConfigLoader:
             )
 
         return data
+
+    # ========================================================
+    # Build Config
+    # ========================================================
 
     @classmethod
     def _build_config(
@@ -348,6 +574,10 @@ class ConfigLoader:
             "logging",
         )
 
+        # =====================
+        # Application
+        # =====================
+
         application = ApplicationConfig(
             name=cls._get_string(
                 application_data,
@@ -362,6 +592,10 @@ class ConfigLoader:
                 default="development",
             ),
         )
+
+        # =====================
+        # Runtime
+        # =====================
 
         runtime = RuntimeConfig(
             input_directory=cls._get_string(
@@ -381,6 +615,10 @@ class ConfigLoader:
             ),
         )
 
+        # =====================
+        # Output
+        # =====================
+
         output = OutputConfig(
             save_json=cls._get_bool(
                 output_data,
@@ -389,12 +627,19 @@ class ConfigLoader:
             )
         )
 
+        # =====================
+        # Database
+        # =====================
+
         password_env = cls._get_string(
             database_data,
             "password_env",
             default="POSTGRES_PASSWORD",
         )
 
+        # 密码必须保持原始值。
+        #
+        # 不 strip，不写日志，不写配置对象之外的位置。
         password = os.getenv(
             password_env
         )
@@ -437,6 +682,10 @@ class ConfigLoader:
             ),
         )
 
+        # =====================
+        # Chunk
+        # =====================
+
         chunk = ChunkConfig(
             max_length=cls._get_int(
                 chunk_data,
@@ -445,6 +694,10 @@ class ConfigLoader:
                 minimum=1,
             )
         )
+
+        # =====================
+        # Logging
+        # =====================
 
         log_level = cls._get_string(
             logging_data,
@@ -477,6 +730,10 @@ class ConfigLoader:
             ),
         )
 
+        # =====================
+        # Final Validation
+        # =====================
+
         cls._validate_database(
             database
         )
@@ -490,12 +747,23 @@ class ConfigLoader:
             logging=logging_config,
         )
 
+    # ========================================================
+    # Database Validation
+    # ========================================================
+
     @staticmethod
     def _validate_database(
         config: DatabaseConfig,
     ) -> None:
         """
         数据库配置最终校验。
+
+        database.enabled=False:
+            不要求数据库凭据。
+
+        database.enabled=True:
+            host / database / user / password
+            必须有效。
         """
 
         if not config.enabled:
@@ -528,7 +796,7 @@ class ConfigLoader:
                 )
             )
 
-        if not config.password:
+        if config.password is None:
             raise (
                 ConfigurationValidationError(
                     "PostgreSQL password "
@@ -538,15 +806,32 @@ class ConfigLoader:
                 )
             )
 
+        if config.password == "":
+            raise (
+                ConfigurationValidationError(
+                    "PostgreSQL password "
+                    "environment variable "
+                    f"'{config.password_env}' "
+                    "is empty."
+                )
+            )
+
+    # ========================================================
+    # Mapping Helpers
+    # ========================================================
+
     @staticmethod
     def _get_mapping(
         data: dict[str, Any],
         key: str,
     ) -> dict[str, Any]:
+        """
+        获取 Mapping 类型配置段。
+        """
 
         value = data.get(
             key,
-            {}
+            {},
         )
 
         if value is None:
@@ -570,6 +855,15 @@ class ConfigLoader:
         *,
         default: str,
     ) -> str:
+        """
+        获取非空字符串。
+
+        缺失 / None / 空字符串：
+            返回 default。
+
+        list / dict 等结构值：
+            判定为配置错误，避免静默 str(...)。
+        """
 
         value = data.get(
             key,
@@ -579,9 +873,16 @@ class ConfigLoader:
         if value is None:
             return default
 
-        normalized = str(
-            value
-        ).strip()
+        if not isinstance(
+            value,
+            str,
+        ):
+            raise ConfigurationValidationError(
+                f"Configuration value "
+                f"'{key}' must be a string."
+            )
+
+        normalized = value.strip()
 
         if not normalized:
             return default
@@ -595,6 +896,11 @@ class ConfigLoader:
         *,
         default: bool,
     ) -> bool:
+        """
+        获取 bool。
+
+        支持 YAML bool 以及常见字符串形式。
+        """
 
         value = data.get(
             key,
@@ -645,27 +951,72 @@ class ConfigLoader:
         minimum: int | None = None,
         maximum: int | None = None,
     ) -> int:
+        """
+        获取整数配置。
+
+        允许：
+            5432
+            "5432"
+
+        拒绝：
+            True
+            5432.5
+            "5432.5"
+
+        防止 int(float) 产生静默截断。
+        """
 
         value = data.get(
             key,
             default,
         )
 
-        try:
-            normalized = int(
-                value
+        if isinstance(
+            value,
+            bool,
+        ):
+            raise ConfigurationValidationError(
+                f"Configuration value "
+                f"'{key}' must be integer."
             )
 
-        except (
-            TypeError,
-            ValueError,
-        ) as exc:
-            raise (
-                ConfigurationValidationError(
+        if isinstance(
+            value,
+            int,
+        ):
+            normalized = value
+
+        elif isinstance(
+            value,
+            str,
+        ):
+            stripped = value.strip()
+
+            if not stripped:
+                raise ConfigurationValidationError(
                     f"Configuration value "
                     f"'{key}' must be integer."
                 )
-            ) from exc
+
+            try:
+                normalized = int(
+                    stripped,
+                    10,
+                )
+
+            except ValueError as exc:
+                raise (
+                    ConfigurationValidationError(
+                        f"Configuration value "
+                        f"'{key}' must be integer."
+                    )
+                ) from exc
+
+        else:
+            raise ConfigurationValidationError(
+                f"Configuration value "
+                f"'{key}' must be integer."
+            )
 
         if (
             minimum is not None

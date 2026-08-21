@@ -122,6 +122,8 @@ class DOCXParser:
 
         removed_invalid_heading_count = 0
         ignored_table_heading_count = 0
+        generated_fallback_chapter_count = 0
+        resolved_fallback_chapter_count = 0
 
         def flush_content() -> None:
 
@@ -221,6 +223,12 @@ class DOCXParser:
                 removed_invalid_heading_count += 1
                 continue
 
+            self._sync_generated_counters(
+                heading_id=heading_id,
+                level=heading_level,
+                counters=generated_counters,
+            )
+
             # =====================
             # Chapter
             # =====================
@@ -236,6 +244,10 @@ class DOCXParser:
                         title_jp=heading_title,
                         title_en=None,
                         level=1,
+                        page_number=(
+                            block.page_number
+                            or 1
+                        ),
                     )
 
                     document.chapters.append(
@@ -245,6 +257,22 @@ class DOCXParser:
                     chapter_map[
                         heading_id
                     ] = chapter
+
+                elif chapter.metadata.get(
+                    "generated_fallback",
+                    False,
+                ):
+                    chapter.title_jp = heading_title
+                    chapter.page_number = (
+                        block.page_number
+                        or chapter.page_number
+                        or 1
+                    )
+                    chapter.metadata.pop(
+                        "generated_fallback",
+                        None,
+                    )
+                    resolved_fallback_chapter_count += 1
 
                 elif (
                     heading_title
@@ -279,6 +307,13 @@ class DOCXParser:
                     title_jp=f"Chapter {chapter_id}",
                     title_en=None,
                     level=1,
+                    page_number=(
+                        block.page_number
+                        or 1
+                    ),
+                    metadata={
+                        "generated_fallback": True,
+                    },
                 )
 
                 document.chapters.append(
@@ -288,6 +323,8 @@ class DOCXParser:
                 chapter_map[
                     chapter_id
                 ] = fallback_chapter
+
+                generated_fallback_chapter_count += 1
 
             current_chapter = chapter_map[
                 chapter_id
@@ -314,6 +351,10 @@ class DOCXParser:
                     level=heading_level,
                     chapter_id=chapter_id,
                     parent_section_id=None,
+                    page_number=(
+                        block.page_number
+                        or 1
+                    ),
                 )
 
                 document.sections.append(
@@ -361,6 +402,12 @@ class DOCXParser:
                 ),
                 "removed_invalid_heading_count": (
                     removed_invalid_heading_count
+                ),
+                "generated_fallback_chapter_count": (
+                    generated_fallback_chapter_count
+                ),
+                "resolved_fallback_chapter_count": (
+                    resolved_fallback_chapter_count
                 ),
             }
         )
@@ -544,6 +591,68 @@ class DOCXParser:
             return True
 
         return False
+
+    @staticmethod
+    def _sync_generated_counters(
+        *,
+        heading_id: str,
+        level: int,
+        counters: defaultdict[int, int],
+    ) -> None:
+        """
+        将显式编号同步到自动编号状态。
+
+        Example:
+            1 Introduction
+            Overview
+
+        第二个无编号 Heading 1 应继续生成 2，
+        而不是再次生成 1。
+        """
+
+        parts = [
+            part
+            for part in heading_id.split(".")
+            if part
+        ]
+
+        if not parts:
+            return
+
+        if not all(
+            part.isdigit()
+            for part in parts
+        ):
+            return
+
+        deeper_levels = [
+            stored_level
+            for stored_level in counters
+            if stored_level > level
+        ]
+
+        for stored_level in deeper_levels:
+            counters.pop(
+                stored_level,
+                None,
+            )
+
+        max_depth = min(
+            level,
+            len(parts),
+        )
+
+        for current_level in range(
+            1,
+            max_depth + 1,
+        ):
+            counters[
+                current_level
+            ] = int(
+                parts[
+                    current_level - 1
+                ]
+            )
 
     @classmethod
     def _generate_heading_id(
@@ -742,7 +851,12 @@ class DOCXParser:
                 "app.model.document.Document instance."
             )
 
-        if document.file_type.lower() != "docx":
+        file_type = str(
+            document.file_type
+            or ""
+        ).strip().lower()
+
+        if file_type != "docx":
             raise ValueError(
                 "DOCXParser only accepts DOCX documents. "
                 f"Received file_type: {document.file_type}"

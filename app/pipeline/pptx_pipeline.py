@@ -35,14 +35,16 @@ class PPTXPipeline:
         5. 解析 Slide、Section 和正文
         6. 去重
         7. 建立 Section 层级
-        8. 分配排序字段
-        9. 清理无效正文
-        10. Chunk 分块
+        8. 清理无效正文
+        9. Chunk 分块
+        10. 分配排序字段和 Chunk Index
         11. Token 统计
-        12. 构建 JSON
-        13. 保存 PostgreSQL
+        12. 写入 Pipeline Metadata
+        13. 构建 JSON
+        14. 保存 PostgreSQL
 
     默认结构映射：
+
         Slide
             -> Chapter
 
@@ -120,25 +122,52 @@ class PPTXPipeline:
                 "chunk_max_length must be greater than 0."
             )
 
-        self.save_json_enabled = save_json
-        self.save_database_enabled = save_database
+        if minimum_slide_block_count < 0:
+            raise ValueError(
+                "minimum_slide_block_count "
+                "must be greater than or equal to 0."
+            )
+
+        if minimum_slide_text_length < 0:
+            raise ValueError(
+                "minimum_slide_text_length "
+                "must be greater than or equal to 0."
+            )
+
+        self.save_json_enabled = bool(
+            save_json
+        )
+
+        self.save_database_enabled = bool(
+            save_database
+        )
 
         # =====================
         # Loader
         # =====================
 
         self.loader = PPTXLoader(
-            include_hidden_slides=include_hidden_slides,
-            include_empty_slides=include_empty_slides,
-            include_images=include_images,
-            include_charts=include_charts,
+            include_hidden_slides=(
+                include_hidden_slides
+            ),
+            include_empty_slides=(
+                include_empty_slides
+            ),
+            include_images=(
+                include_images
+            ),
+            include_charts=(
+                include_charts
+            ),
             include_empty_image_blocks=(
                 include_empty_image_blocks
             ),
             include_empty_chart_blocks=(
                 include_empty_chart_blocks
             ),
-            extract_chart_data=extract_chart_data,
+            extract_chart_data=(
+                extract_chart_data
+            ),
             extract_text_per_paragraph=(
                 extract_text_per_paragraph
             ),
@@ -148,14 +177,18 @@ class PPTXPipeline:
             recursive_group_shapes=(
                 recursive_group_shapes
             ),
-            reading_order=reading_order,
+            reading_order=(
+                reading_order
+            ),
         )
 
         # =====================
         # Normalizer
         # =====================
 
-        self.unicode_normalizer = UnicodeNormalizer()
+        self.unicode_normalizer = (
+            UnicodeNormalizer()
+        )
 
         # =====================
         # PPTX Filters
@@ -193,7 +226,9 @@ class PPTXPipeline:
             remove_page_numbers=(
                 remove_page_numbers
             ),
-            remove_dates=remove_dates,
+            remove_dates=(
+                remove_dates
+            ),
             remove_version_lines=(
                 remove_version_lines
             ),
@@ -209,7 +244,9 @@ class PPTXPipeline:
             reassign_block_order=True,
         )
 
-        self.content_filter = ContentFilter()
+        self.content_filter = (
+            ContentFilter()
+        )
 
         # =====================
         # Parser
@@ -249,28 +286,40 @@ class PPTXPipeline:
         # Common Processors
         # =====================
 
-        self.deduplicator = Deduplicator()
+        self.deduplicator = (
+            Deduplicator()
+        )
 
         self.section_hierarchy = (
             SectionHierarchyBuilder()
-        )
-
-        self.sort_order_assigner = (
-            SortOrderAssigner()
         )
 
         self.chunker = Chunker(
             max_length=chunk_max_length
         )
 
-        self.token_counter = TokenCounter()
+        self.sort_order_assigner = (
+            SortOrderAssigner()
+        )
+
+        self.token_counter = (
+            TokenCounter()
+        )
 
         # =====================
         # Output
         # =====================
 
         self.builder = JsonBuilder()
-        self.storage = PostgresStorage()
+
+        # PostgreSQL 延迟初始化。
+        #
+        # save_database=False 时：
+        #
+        #     - 不创建 PostgresStorage
+        #     - 不读取数据库 Secret
+        #     - 不建立数据库相关资源
+        self.storage: PostgresStorage | None = None
 
     def run(
         self,
@@ -287,179 +336,239 @@ class PPTXPipeline:
             output:
                 JSON 输出路径。
 
+                save_json=False 时，
+                不会访问该路径。
+
         Returns:
-            解析、过滤、分块并完成 Token 统计后的 Document。
+            解析、过滤、分块并完成 Token
+            统计后的 Document。
         """
 
         input_path = self._validate_input_path(
             file_path
         )
 
-        output_path = Path(
-            output
-        ).expanduser()
+        # =====================
+        # 1. Load
+        # =====================
 
-        try:
-            # =====================
-            # 1. Load
-            # =====================
+        document = self.loader.load(
+            str(input_path)
+        )
 
-            document = self.loader.load(
-                str(input_path)
+        # =====================
+        # 2. Unicode Normalize
+        # =====================
+
+        document = (
+            self.unicode_normalizer.process(
+                document
             )
+        )
 
-            # =====================
-            # 2. Unicode Normalize
-            # =====================
+        # =====================
+        # 3. Slide Filter
+        # =====================
 
-            document = (
-                self.unicode_normalizer.process(
-                    document
+        document = (
+            self.slide_filter.filter(
+                document
+            )
+        )
+
+        # =====================
+        # 4. Shape Filter
+        # =====================
+
+        document = (
+            self.shape_filter.filter(
+                document
+            )
+        )
+
+        # =====================
+        # 5. Parse
+        # =====================
+
+        document = self.parser.parse(
+            document
+        )
+
+        # =====================
+        # 6. Deduplicate
+        # =====================
+
+        document = (
+            self.deduplicator.process(
+                document
+            )
+        )
+
+        # =====================
+        # 7. Section Hierarchy
+        # =====================
+
+        document = (
+            self.section_hierarchy.process(
+                document
+            )
+        )
+
+        # =====================
+        # 8. Content Filter
+        # =====================
+
+        document = (
+            self.content_filter.filter(
+                document
+            )
+        )
+
+        # =====================
+        # 9. Chunk
+        # =====================
+
+        document = (
+            self.chunker.process(
+                document
+            )
+        )
+
+        # =====================
+        # 10. Sort Order
+        # =====================
+        #
+        # 必须在 Chunker 后执行。
+        #
+        # 一个 Parser Content 可能被 Chunker
+        # 拆成多个最终 Content。
+        #
+        # 因此 chunk_index / sort_order
+        # 应针对最终 Chunk 重新分配。
+
+        document = (
+            self.sort_order_assigner.process(
+                document
+            )
+        )
+
+        # =====================
+        # 11. Token Count
+        # =====================
+
+        document = (
+            self.token_counter.process(
+                document
+            )
+        )
+
+        # =====================
+        # 12. Metadata
+        # =====================
+
+        document.metadata.update(
+            {
+                "pipeline": "PPTXPipeline",
+                "pipeline_status": "SUCCESS",
+                "page_count": len(
+                    document.pages
+                ),
+                "block_count": len(
+                    document.blocks
+                ),
+                "chapter_count": len(
+                    document.chapters
+                ),
+                "section_count": len(
+                    document.sections
+                ),
+                "content_count": len(
+                    document.contents
+                ),
+                "save_json": (
+                    self.save_json_enabled
+                ),
+                "save_database": (
+                    self.save_database_enabled
+                ),
+            }
+        )
+
+        # =====================
+        # 13. JSON
+        # =====================
+
+        if self.save_json_enabled:
+            output_path = (
+                self._validate_output_path(
+                    output
                 )
             )
 
-            # =====================
-            # 3. Slide Filter
-            # =====================
+            output_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
-            document = self.slide_filter.filter(
+            json_data = self.builder.build(
                 document
             )
 
-            # =====================
-            # 4. Shape Filter
-            # =====================
+            self.builder.save(
+                json_data,
+                str(output_path),
+            )
 
-            document = self.shape_filter.filter(
+        # =====================
+        # 14. PostgreSQL
+        # =====================
+
+        if self.save_database_enabled:
+            storage = self._get_storage()
+
+            storage.save(
                 document
             )
 
-            # =====================
-            # 5. Parse
-            # =====================
+        return document
 
-            document = self.parser.parse(
-                document
+    def _get_storage(
+        self,
+    ) -> PostgresStorage:
+        """
+        延迟创建 PostgreSQL Storage。
+
+        仅当：
+
+            save_database=True
+
+        并真正执行数据库输出阶段时，
+        才创建 PostgresStorage。
+        """
+
+        if self.storage is None:
+            self.storage = (
+                PostgresStorage()
             )
 
-            # =====================
-            # 6. Deduplicate
-            # =====================
-
-            document = self.deduplicator.process(
-                document
-            )
-
-            # =====================
-            # 7. Section Hierarchy
-            # =====================
-
-            document = (
-                self.section_hierarchy.process(
-                    document
-                )
-            )
-
-            # =====================
-            # 8. Sort Order
-            # =====================
-
-            document = (
-                self.sort_order_assigner.process(
-                    document
-                )
-            )
-
-            # =====================
-            # 9. Content Filter
-            # =====================
-
-            document = self.content_filter.filter(
-                document
-            )
-
-            # =====================
-            # 10. Chunk
-            # =====================
-
-            document = self.chunker.process(
-                document
-            )
-
-            # =====================
-            # 11. Token Count
-            # =====================
-
-            document = self.token_counter.process(
-                document
-            )
-
-            # =====================
-            # 12. Metadata
-            # =====================
-
-            document.metadata.update(
-                {
-                    "pipeline": "PPTXPipeline",
-                    "pipeline_status": "SUCCESS",
-                    "page_count": len(
-                        document.pages
-                    ),
-                    "block_count": len(
-                        document.blocks
-                    ),
-                    "chapter_count": len(
-                        document.chapters
-                    ),
-                    "section_count": len(
-                        document.sections
-                    ),
-                    "content_count": len(
-                        document.contents
-                    ),
-                }
-            )
-
-            # =====================
-            # 13. JSON
-            # =====================
-
-            if self.save_json_enabled:
-                output_path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                json_data = self.builder.build(
-                    document
-                )
-
-                self.builder.save(
-                    json_data,
-                    str(output_path),
-                )
-
-            # =====================
-            # 14. PostgreSQL
-            # =====================
-
-            if self.save_database_enabled:
-                self.storage.save(
-                    document
-                )
-
-            return document
-
-        except Exception as exc:
-            raise RuntimeError(
-                f"PPTX pipeline failed for "
-                f"'{input_path.name}': {exc}"
-            ) from exc
+        return self.storage
 
     @staticmethod
     def _validate_input_path(
         file_path: str | Path,
     ) -> Path:
+
+        if file_path is None:
+            raise ValueError(
+                "file_path cannot be None."
+            )
+
+        if not str(
+            file_path
+        ).strip():
+            raise ValueError(
+                "file_path cannot be empty."
+            )
 
         path = Path(
             file_path
@@ -475,17 +584,44 @@ class PPTXPipeline:
                 f"Input path is not a file: {path}"
             )
 
-        if path.name.startswith("~$"):
+        if path.name.startswith(
+            "~$"
+        ):
             raise ValueError(
-                "Temporary PowerPoint file is not supported: "
+                "Temporary PowerPoint file "
+                "is not supported: "
                 f"{path.name}"
             )
 
         if path.suffix.lower() != ".pptx":
             raise ValueError(
-                "PPTXPipeline only accepts .pptx files. "
+                "PPTXPipeline only accepts "
+                ".pptx files. "
                 f"Received: "
                 f"{path.suffix or '<no extension>'}"
             )
 
         return path
+
+    @staticmethod
+    def _validate_output_path(
+        output: str | Path,
+    ) -> Path:
+
+        if output is None:
+            raise ValueError(
+                "output cannot be None when "
+                "save_json=True."
+            )
+
+        if not str(
+            output
+        ).strip():
+            raise ValueError(
+                "output cannot be empty when "
+                "save_json=True."
+            )
+
+        return Path(
+            output
+        ).expanduser()

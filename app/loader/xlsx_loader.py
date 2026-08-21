@@ -55,15 +55,16 @@ class XLSXLoader(BaseLoader):
         self,
         *,
         read_only: bool = True,
-        data_only: bool = True,
+        data_only: bool = False,
         keep_links: bool = False,
-        include_hidden_sheets: bool = False,
-        include_very_hidden_sheets: bool = False,
+        include_hidden_sheets: bool = True,
+        include_very_hidden_sheets: bool = True,
         include_empty_cells_between_values: bool = True,
         preserve_formulas_in_metadata: bool = False,
         row_separator: str = " | ",
         maximum_rows_per_sheet: int | None = None,
         maximum_columns_per_sheet: int | None = None,
+        print_summary: bool = False,
     ) -> None:
 
         if not row_separator:
@@ -91,6 +92,12 @@ class XLSXLoader(BaseLoader):
             raise ValueError(
                 "preserve_formulas_in_metadata=True requires "
                 "read_only=False."
+            )
+
+        if preserve_formulas_in_metadata and data_only:
+            raise ValueError(
+                "preserve_formulas_in_metadata=True requires "
+                "data_only=False."
             )
 
         self.read_only = read_only
@@ -121,6 +128,10 @@ class XLSXLoader(BaseLoader):
 
         self.maximum_columns_per_sheet = (
             maximum_columns_per_sheet
+        )
+
+        self.print_summary = bool(
+            print_summary
         )
 
     def load(
@@ -307,6 +318,9 @@ class XLSXLoader(BaseLoader):
                         "row_number": row_number,
                         "column_count": len(values),
                         "cell_coordinates": coordinates,
+                        "column_position_preserved": (
+                            self.include_empty_cells_between_values
+                        ),
                     }
 
                     if formulas:
@@ -406,6 +420,15 @@ class XLSXLoader(BaseLoader):
                 "read_only": self.read_only,
                 "data_only": self.data_only,
                 "keep_links": self.keep_links,
+                "include_empty_cells_between_values": (
+                    self.include_empty_cells_between_values
+                ),
+                "column_position_preserved": (
+                    self.include_empty_cells_between_values
+                ),
+                "preserve_formulas_in_metadata": (
+                    self.preserve_formulas_in_metadata
+                ),
                 "sheet_count": total_sheet_count,
                 "processed_sheet_count": (
                     processed_sheet_count
@@ -429,10 +452,11 @@ class XLSXLoader(BaseLoader):
                 "sheets": sheet_metadata,
             }
 
-            self._print_summary(
-                path=path,
-                metadata=metadata,
-            )
+            if self.print_summary:
+                self._print_summary(
+                    path=path,
+                    metadata=metadata,
+                )
 
             return Document(
                 file_name=path.name,
@@ -445,6 +469,9 @@ class XLSXLoader(BaseLoader):
                 metadata=metadata,
             )
 
+        except XLSXLoaderError:
+            raise
+
         except Exception as exc:
             raise XLSXLoaderError(
                 f"Failed to load XLSX file "
@@ -453,7 +480,10 @@ class XLSXLoader(BaseLoader):
 
         finally:
             if workbook is not None:
-                workbook.close()
+                try:
+                    workbook.close()
+                except Exception:
+                    pass
 
     def _iter_rows(
         self,
@@ -565,7 +595,7 @@ class XLSXLoader(BaseLoader):
         (
             normalized_values,
             coordinates,
-        ) = self._trim_row_boundaries(
+        ) = self._trim_trailing_empty_cells(
             values=normalized_values,
             coordinates=coordinates,
         )
@@ -758,15 +788,17 @@ class XLSXLoader(BaseLoader):
             " ",
         )
 
-        normalized = normalized.replace(
+        for character in (
             "\u200b",
-            "",
-        )
-
-        normalized = normalized.replace(
+            "\u200c",
+            "\u200d",
+            "\u2060",
             "\ufeff",
-            "",
-        )
+        ):
+            normalized = normalized.replace(
+                character,
+                "",
+            )
 
         normalized = normalized.replace(
             "\r\n",
@@ -789,52 +821,65 @@ class XLSXLoader(BaseLoader):
         ).strip()
 
     @staticmethod
+    def _trim_trailing_empty_cells(
+        *,
+        values: list[str],
+        coordinates: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """
+        仅删除最右侧连续空单元格。
+
+        重要：
+            行首空 Cell 必须保留，否则会破坏真实列位置。
+
+        Example:
+
+            ["", "", "A", "", "B", "", ""]
+
+        ->
+
+            ["", "", "A", "", "B"]
+
+        这样第一个有效值仍然明确位于 C 列。
+        """
+
+        if not values:
+            return [], []
+
+        end = len(values)
+
+        while (
+            end > 0
+            and not values[end - 1]
+        ):
+            end -= 1
+
+        if end == 0:
+            return [], []
+
+        return (
+            values[:end],
+            coordinates[:end],
+        )
+
+    @staticmethod
     def _trim_row_boundaries(
         *,
         values: list[str],
         coordinates: list[str],
     ) -> tuple[list[str], list[str]]:
         """
-        删除行首和行尾的空单元格。
+        兼容旧私有方法名。
 
-        中间空单元格保留，以维持列语义。
+        当前语义已经改为：
+            仅裁剪行尾空 Cell。
+
+        不再删除行首空 Cell。
         """
 
-        if not values:
-            return [], []
-
-        first_non_empty = None
-        last_non_empty = None
-
-        for index, value in enumerate(values):
-            if value:
-                first_non_empty = index
-                break
-
-        if first_non_empty is None:
-            return [], []
-
-        for index in range(
-            len(values) - 1,
-            -1,
-            -1,
-        ):
-            if values[index]:
-                last_non_empty = index
-                break
-
-        if last_non_empty is None:
-            return [], []
-
-        return (
-            values[
-                first_non_empty:
-                last_non_empty + 1
-            ],
-            coordinates[
-                first_non_empty:
-                last_non_empty + 1
-            ],
+        return XLSXLoader._trim_trailing_empty_cells(
+            values=values,
+            coordinates=coordinates,
         )
 
     @staticmethod
@@ -899,6 +944,18 @@ class XLSXLoader(BaseLoader):
         cls,
         file_path: str | Path,
     ) -> Path:
+
+        if file_path is None:
+            raise ValueError(
+                "file_path cannot be None."
+            )
+
+        if not str(
+            file_path
+        ).strip():
+            raise ValueError(
+                "file_path cannot be empty."
+            )
 
         path = Path(
             file_path
@@ -991,3 +1048,19 @@ class XLSXLoader(BaseLoader):
         )
         print("=======================")
         print()
+
+# ======================================================
+# Compatibility Alias
+# ======================================================
+#
+# 兼容：
+#
+#     from app.loader.excel_loader import ExcelLoader
+#
+# 与：
+#
+#     from app.loader.xlsx_loader import XLSXLoader
+#
+# 使用同一实现。
+
+ExcelLoader = XLSXLoader

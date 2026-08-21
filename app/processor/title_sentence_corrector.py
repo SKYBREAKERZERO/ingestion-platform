@@ -85,11 +85,21 @@ class TitleSentenceCorrector:
         replacements: Mapping[str, str] | None = None,
         enable_default_replacements: bool = True,
         split_camel_case: bool = True,
+        split_letter_number: bool = False,
         normalize_title_case: bool = False,
     ) -> None:
 
-        self.split_camel_case = split_camel_case
-        self.normalize_title_case = normalize_title_case
+        self.split_camel_case = bool(
+            split_camel_case
+        )
+
+        self.split_letter_number = bool(
+            split_letter_number
+        )
+
+        self.normalize_title_case = bool(
+            normalize_title_case
+        )
 
         merged_replacements: dict[str, str] = {}
 
@@ -107,11 +117,14 @@ class TitleSentenceCorrector:
                 }
             )
 
-        # 长字符串优先替换，避免短规则抢先匹配。
+        # 长字符串优先替换，
+        # 避免短规则抢先匹配。
         self.replacements = dict(
             sorted(
                 merged_replacements.items(),
-                key=lambda item: len(item[0]),
+                key=lambda item: len(
+                    item[0]
+                ),
                 reverse=True,
             )
         )
@@ -129,13 +142,13 @@ class TitleSentenceCorrector:
         corrected_section_count = 0
         replacement_count = 0
 
+        # =====================
+        # Chapter
+        # =====================
+
         for chapter in document.chapters:
             original_jp = chapter.title_jp
-            original_en = getattr(
-                chapter,
-                "title_en",
-                None,
-            )
+            original_en = chapter.title_en
 
             corrected_jp, jp_replacements = (
                 self.correct_title(
@@ -150,11 +163,13 @@ class TitleSentenceCorrector:
             )
 
             chapter.title_jp = (
-                corrected_jp or None
+                corrected_jp
+                or None
             )
 
             chapter.title_en = (
-                corrected_en or None
+                corrected_en
+                or None
             )
 
             replacement_count += (
@@ -163,18 +178,20 @@ class TitleSentenceCorrector:
             )
 
             if (
-                chapter.title_jp != original_jp
-                or chapter.title_en != original_en
+                chapter.title_jp
+                != original_jp
+                or chapter.title_en
+                != original_en
             ):
                 corrected_chapter_count += 1
 
+        # =====================
+        # Section
+        # =====================
+
         for section in document.sections:
             original_jp = section.title_jp
-            original_en = getattr(
-                section,
-                "title_en",
-                None,
-            )
+            original_en = section.title_en
 
             corrected_jp, jp_replacements = (
                 self.correct_title(
@@ -189,11 +206,13 @@ class TitleSentenceCorrector:
             )
 
             section.title_jp = (
-                corrected_jp or None
+                corrected_jp
+                or None
             )
 
             section.title_en = (
-                corrected_en or None
+                corrected_en
+                or None
             )
 
             replacement_count += (
@@ -202,10 +221,16 @@ class TitleSentenceCorrector:
             )
 
             if (
-                section.title_jp != original_jp
-                or section.title_en != original_en
+                section.title_jp
+                != original_jp
+                or section.title_en
+                != original_en
             ):
                 corrected_section_count += 1
+
+        # =====================
+        # Metadata
+        # =====================
 
         document.metadata.update(
             {
@@ -224,6 +249,15 @@ class TitleSentenceCorrector:
                 "title_replacement_count": (
                     replacement_count
                 ),
+                "title_split_camel_case": (
+                    self.split_camel_case
+                ),
+                "title_split_letter_number": (
+                    self.split_letter_number
+                ),
+                "title_normalize_title_case": (
+                    self.normalize_title_case
+                ),
             }
         )
 
@@ -233,17 +267,142 @@ class TitleSentenceCorrector:
         self,
         text: str,
     ) -> tuple[str, int]:
+        """
+        修正单个标题。
+
+        Returns:
+            corrected_text
+            replacement_count
+        """
 
         if not text:
             return "", 0
+
+        if not isinstance(
+            text,
+            str,
+        ):
+            raise TypeError(
+                "TitleSentenceCorrector.correct_title() "
+                "expects text to be a string."
+            )
 
         corrected = self._normalize_spacing(
             text
         )
 
+        # =====================
+        # Explicit Replacement
+        # =====================
+        #
+        # 显式词典优先执行一次。
+        #
+        # Example:
+        #
+        #     Car Play
+        #         ↓
+        #     CarPlay
+
+        corrected, replacement_count = (
+            self._apply_replacements(
+                corrected,
+                count_replacements=True,
+            )
+        )
+
+        # =====================
+        # CamelCase
+        # =====================
+
+        if self.split_camel_case:
+            corrected = self._split_camel_case(
+                corrected,
+                split_letter_number=(
+                    self.split_letter_number
+                ),
+            )
+
+        corrected = self._normalize_spacing(
+            corrected
+        )
+
+        # =====================
+        # Title Case
+        # =====================
+
+        if self.normalize_title_case:
+            corrected = (
+                self._apply_safe_title_case(
+                    corrected
+                )
+            )
+
+        # =====================
+        # Final Replacement
+        # =====================
+        #
+        # 显式 replacement 必须具有
+        # 最终最高优先级。
+        #
+        # 否则：
+        #
+        #     Car Play
+        #       ↓ replacement
+        #     CarPlay
+        #       ↓ camel split
+        #     Car Play
+        #
+        # 前面的修正会被撤销。
+        #
+        # 第二次 replacement 不增加统计数量，
+        # 仅用于稳定最终结果。
+
+        corrected, _ = (
+            self._apply_replacements(
+                corrected,
+                count_replacements=False,
+            )
+        )
+
+        corrected = self._normalize_spacing(
+            corrected
+        )
+
+        return (
+            corrected,
+            replacement_count,
+        )
+
+    def _apply_replacements(
+        self,
+        text: str,
+        *,
+        count_replacements: bool,
+    ) -> tuple[str, int]:
+        """
+        应用显式 replacement。
+
+        规则已经在 __init__ 中按 source
+        长度从长到短排列。
+
+        Args:
+            text:
+                输入文本。
+
+            count_replacements:
+                是否统计 replacement 次数。
+
+        Returns:
+            corrected_text
+            replacement_count
+        """
+
+        corrected = text
         replacement_count = 0
 
-        for source, target in self.replacements.items():
+        for source, target in (
+            self.replacements.items()
+        ):
             if source not in corrected:
                 continue
 
@@ -256,29 +415,24 @@ class TitleSentenceCorrector:
                 target,
             )
 
-            replacement_count += occurrences
+            if count_replacements:
+                replacement_count += (
+                    occurrences
+                )
 
-        if self.split_camel_case:
-            corrected = self._split_camel_case(
-                corrected
-            )
-
-        corrected = self._normalize_spacing(
-            corrected
+        return (
+            corrected,
+            replacement_count,
         )
-
-        if self.normalize_title_case:
-            corrected = self._apply_safe_title_case(
-                corrected
-            )
-
-        return corrected, replacement_count
 
     @classmethod
     def _normalize_spacing(
         cls,
         text: str,
     ) -> str:
+        """
+        标题空格和标点规范化。
+        """
 
         normalized = text.replace(
             "\u3000",
@@ -290,9 +444,11 @@ class TitleSentenceCorrector:
             " ",
         )
 
-        normalized = cls._MULTIPLE_SPACES_PATTERN.sub(
-            " ",
-            normalized,
+        normalized = (
+            cls._MULTIPLE_SPACES_PATTERN.sub(
+                " ",
+                normalized,
+            )
         )
 
         normalized = (
@@ -316,14 +472,18 @@ class TitleSentenceCorrector:
             )
         )
 
-        normalized = cls._SLASH_SPACING_PATTERN.sub(
-            "/",
-            normalized,
+        normalized = (
+            cls._SLASH_SPACING_PATTERN.sub(
+                "/",
+                normalized,
+            )
         )
 
-        normalized = cls._HYPHEN_SPACING_PATTERN.sub(
-            "-",
-            normalized,
+        normalized = (
+            cls._HYPHEN_SPACING_PATTERN.sub(
+                "-",
+                normalized,
+            )
         )
 
         return normalized.strip()
@@ -332,19 +492,42 @@ class TitleSentenceCorrector:
     def _split_camel_case(
         cls,
         text: str,
+        *,
+        split_letter_number: bool = False,
     ) -> str:
+        """
+        拆分普通 CamelCase。
 
-        corrected = cls._CAMEL_CASE_PATTERN.sub(
-            " ",
-            text,
-        )
+        Example:
+
+            AuthorityManagement
+                ->
+            Authority Management
+
+        默认不会拆分：
+
+            MM21
+            21MM
+            CAN1
+            ECU2
+
+        因为这些通常是技术标识符。
+        """
 
         corrected = (
-            cls._LETTER_NUMBER_BOUNDARY_PATTERN.sub(
+            cls._CAMEL_CASE_PATTERN.sub(
                 " ",
-                corrected,
+                text,
             )
         )
+
+        if split_letter_number:
+            corrected = (
+                cls._LETTER_NUMBER_BOUNDARY_PATTERN.sub(
+                    " ",
+                    corrected,
+                )
+            )
 
         return corrected
 
@@ -386,21 +569,40 @@ class TitleSentenceCorrector:
 
         result: list[str] = []
 
-        for index, word in enumerate(words):
+        for index, word in enumerate(
+            words
+        ):
+            # 短大写缩写保持原样。
+            #
+            # Example:
+            #
+            #     ECU
+            #     CAN
+            #     API
+            #     HMI
+
             if (
                 word.isupper()
                 and len(word) <= 6
             ):
-                result.append(word)
+                result.append(
+                    word
+                )
+
                 continue
 
             lower_word = word.lower()
 
+            # 非首词的小词保持小写。
             if (
                 index > 0
-                and lower_word in lower_words
+                and lower_word
+                in lower_words
             ):
-                result.append(lower_word)
+                result.append(
+                    lower_word
+                )
+
                 continue
 
             result.append(
@@ -408,7 +610,9 @@ class TitleSentenceCorrector:
                 + lower_word[1:]
             )
 
-        return " ".join(result)
+        return " ".join(
+            result
+        )
 
     @staticmethod
     def _validate_document(

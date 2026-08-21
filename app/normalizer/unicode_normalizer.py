@@ -112,11 +112,12 @@ class UnicodeNormalizer:
 
         if self.normalize_structure:
             for chapter in document.chapters:
+                original_id = chapter.id
                 original_title_jp = chapter.title_jp
-                original_title_en = getattr(
-                    chapter,
-                    "title_en",
-                    None,
+                original_title_en = chapter.title_en
+
+                chapter.id = self.normalize_identifier(
+                    chapter.id
                 )
 
                 chapter.title_jp = self.normalize_line(
@@ -124,10 +125,13 @@ class UnicodeNormalizer:
                 ) or None
 
                 chapter.title_en = self.normalize_line(
-                    original_title_en or ""
+                    chapter.title_en or ""
                 ) or None
 
-                normalized_field_count += 2
+                normalized_field_count += 3
+
+                if chapter.id != original_id:
+                    changed_field_count += 1
 
                 if chapter.title_jp != original_title_jp:
                     changed_field_count += 1
@@ -136,12 +140,13 @@ class UnicodeNormalizer:
                     changed_field_count += 1
 
             for section in document.sections:
-                original_title_jp = section.title_jp
-                original_title_en = getattr(
-                    section,
-                    "title_en",
-                    None,
+                original_id = section.id
+                original_chapter_id = section.chapter_id
+                original_parent_section_id = (
+                    section.parent_section_id
                 )
+                original_title_jp = section.title_jp
+                original_title_en = section.title_en
 
                 section.id = self.normalize_identifier(
                     section.id
@@ -159,11 +164,7 @@ class UnicodeNormalizer:
                     self.normalize_identifier(
                         section.parent_section_id
                     )
-                    if getattr(
-                        section,
-                        "parent_section_id",
-                        None,
-                    )
+                    if section.parent_section_id
                     else None
                 )
 
@@ -172,10 +173,22 @@ class UnicodeNormalizer:
                 ) or None
 
                 section.title_en = self.normalize_line(
-                    original_title_en or ""
+                    section.title_en or ""
                 ) or None
 
                 normalized_field_count += 5
+
+                if section.id != original_id:
+                    changed_field_count += 1
+
+                if section.chapter_id != original_chapter_id:
+                    changed_field_count += 1
+
+                if (
+                    section.parent_section_id
+                    != original_parent_section_id
+                ):
+                    changed_field_count += 1
 
                 if section.title_jp != original_title_jp:
                     changed_field_count += 1
@@ -186,6 +199,8 @@ class UnicodeNormalizer:
         if self.normalize_contents:
             for content in document.contents:
                 original_text = content.text
+                original_chapter_id = content.chapter_id
+                original_section_id = content.section_id
 
                 content.text = self.normalize_multiline(
                     content.text
@@ -208,6 +223,12 @@ class UnicodeNormalizer:
                 normalized_field_count += 3
 
                 if content.text != original_text:
+                    changed_field_count += 1
+
+                if content.chapter_id != original_chapter_id:
+                    changed_field_count += 1
+
+                if content.section_id != original_section_id:
                     changed_field_count += 1
 
         document.metadata.update(
@@ -238,7 +259,7 @@ class UnicodeNormalizer:
         original_style_name = block.style_name
         original_cells = list(block.cells)
 
-        block.text = self.normalize_line(
+        block.text = self.normalize_multiline(
             block.text
         )
 
@@ -250,10 +271,14 @@ class UnicodeNormalizer:
             else None
         )
 
+        # Loader 已经保留了表格 Cell 的真实列位置。
+        # UnicodeNormalizer 只能标准化 Cell 文本，
+        # 不能删除空 Cell，否则会导致列左移。
         block.cells = [
-            self.normalize_line(cell)
+            self.normalize_line(
+                cell
+            )
             for cell in block.cells
-            if self.normalize_line(cell)
         ]
 
         normalized_count += 3
@@ -316,15 +341,17 @@ class UnicodeNormalizer:
             " ",
         )
 
-        normalized = normalized.replace(
+        for character in (
             "\u200b",
-            "",
-        )
-
-        normalized = normalized.replace(
+            "\u200c",
+            "\u200d",
+            "\u2060",
             "\ufeff",
-            "",
-        )
+        ):
+            normalized = normalized.replace(
+                character,
+                "",
+            )
 
         normalized = cls._CONTROL_CHARACTER_PATTERN.sub(
             "",

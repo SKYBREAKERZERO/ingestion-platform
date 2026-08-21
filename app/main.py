@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 from app.config.config_loader import (
@@ -10,9 +11,9 @@ from app.config.config_loader import (
     ConfigLoader,
     ConfigurationError,
 )
-
-from app.pipeline.pipeline_factory import (
-    PipelineFactory,
+from app.router.pipeline_router import (
+    PipelineRouteResult,
+    PipelineRouter,
 )
 
 
@@ -34,11 +35,31 @@ IS_FROZEN = bool(
 )
 
 
+@dataclass(frozen=True)
+class RuntimeContext:
+    """
+    主程序运行上下文。
+
+    仅保存已经加载并解析完成的运行配置，
+    避免在模块 import 阶段读取 config.yaml。
+    """
+
+    config: AppConfig
+    base_directory: Path
+    input_directory: Path
+    output_directory: Path
+    log_directory: Path
+    save_json: bool
+    save_database: bool
+    chunk_max_length: int
+
+
 def get_application_directory() -> Path:
     """
     获取应用程序运行目录。
 
     Python 开发环境：
+        当前 main.py 位于 app/ 下时，
         返回项目根目录。
 
     PyInstaller EXE：
@@ -55,29 +76,17 @@ def get_application_directory() -> Path:
     ).resolve().parents[1]
 
 
-BASE_DIR = (
-    get_application_directory()
-)
-
-
 def load_application_config() -> AppConfig:
     """
     加载应用配置。
 
-    默认位置：
+    注意：
+        只允许在真正启动应用时调用。
 
-        Python:
-            <project>/config/config.yaml
-
-        EXE:
-            <exe>/config/config.yaml
-
-    Returns:
-        AppConfig
-
-    Raises:
-        ConfigurationError:
-            配置文件不存在、格式错误或校验失败。
+        不在模块 import 阶段执行，
+        这样测试、GUI、其他模块 import main
+        时不会因为配置文件或数据库环境变量
+        产生副作用。
     """
 
     try:
@@ -93,69 +102,132 @@ def load_application_config() -> AppConfig:
         ) from exc
 
 
-CONFIG = load_application_config()
+def build_runtime_context(
+    config: AppConfig,
+) -> RuntimeContext:
+    """
+    根据 AppConfig 构建运行上下文。
+    """
+
+    if config is None:
+        raise ConfigurationError(
+            "Application config cannot be None."
+        )
+
+    base_directory = (
+        get_application_directory()
+    )
+
+    input_directory = (
+        base_directory
+        / config.runtime.input_directory
+    ).resolve()
+
+    output_directory = (
+        base_directory
+        / config.runtime.output_directory
+    ).resolve()
+
+    log_directory = (
+        base_directory
+        / config.runtime.log_directory
+    ).resolve()
+
+    save_json = bool(
+        config.output.save_json
+    )
+
+    save_database = bool(
+        config.database.enabled
+    )
+
+    chunk_max_length = int(
+        config.chunk.max_length
+    )
+
+    if chunk_max_length <= 0:
+        raise ConfigurationError(
+            "chunk.max_length must be greater than 0."
+        )
+
+    if (
+        not save_json
+        and not save_database
+    ):
+        raise ConfigurationError(
+            "At least one output must be enabled: "
+            "JSON or PostgreSQL."
+        )
+
+    return RuntimeContext(
+        config=config,
+        base_directory=base_directory,
+        input_directory=input_directory,
+        output_directory=output_directory,
+        log_directory=log_directory,
+        save_json=save_json,
+        save_database=save_database,
+        chunk_max_length=chunk_max_length,
+    )
 
 
 # =====================
-# Runtime Paths
+# Runtime Directories
 # =====================
 
-INPUT_DIR = (
-    BASE_DIR
-    / CONFIG.runtime.input_directory
-).resolve()
 
-OUTPUT_DIR = (
-    BASE_DIR
-    / CONFIG.runtime.output_directory
-).resolve()
+def ensure_directories(
+    context: RuntimeContext,
+) -> None:
+    """
+    创建当前运行模式真正需要的目录。
 
-LOG_DIR = (
-    BASE_DIR
-    / CONFIG.runtime.log_directory
-).resolve()
+    JSON disabled 时不主动创建 output 目录，
+    避免 database-only 模式产生无关 JSON 副作用。
+    """
+
+    required_directories = [
+        context.input_directory,
+        context.log_directory,
+    ]
+
+    if context.save_json:
+        required_directories.append(
+            context.output_directory
+        )
+
+    for directory in required_directories:
+        directory.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
 
 # =====================
-# Runtime Options
+# Logging
 # =====================
 
-SAVE_JSON = (
-    CONFIG.output.save_json
-)
 
-SAVE_DATABASE = (
-    CONFIG.database.enabled
-)
-
-CHUNK_MAX_LENGTH = (
-    CONFIG.chunk.max_length
-)
-
-
-def configure_logging() -> None:
+def configure_logging(
+    context: RuntimeContext,
+) -> None:
     """
     初始化日志系统。
-
-    日志配置从 config.yaml 获取：
-
-        logging.level
-        logging.file_name
     """
 
-    LOG_DIR.mkdir(
+    context.log_directory.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     log_file = (
-        LOG_DIR
-        / CONFIG.logging.file_name
+        context.log_directory
+        / context.config.logging.file_name
     )
 
     log_level = getattr(
         logging,
-        CONFIG.logging.level,
+        context.config.logging.level,
         logging.INFO,
     )
 
@@ -180,259 +252,67 @@ def configure_logging() -> None:
     )
 
 
-def ensure_directories() -> None:
+# =====================
+# Pipeline
+# =====================
+
+
+def build_pipeline_kwargs(
+    context: RuntimeContext,
+) -> dict[str, object]:
     """
-    创建运行所需目录。
-
-    不依赖目录预先存在。
-    """
-
-    for directory in (
-        INPUT_DIR,
-        OUTPUT_DIR,
-        LOG_DIR,
-    ):
-        directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-
-def discover_input_files() -> list[Path]:
-    """
-    获取 input 目录下所有受支持文档。
-
-    排序规则：
-        1. 扩展名
-        2. 文件名
-
-    自动忽略：
-        - Office 临时文件
-        - 未支持格式
-        - 文件夹
+    构建所有格式 Pipeline 共用参数。
     """
 
-    files = [
-        file
-        for file in INPUT_DIR.iterdir()
-        if (
-            file.is_file()
-            and not file.name.startswith(
-                "~$"
+    return {
+        "save_json": context.save_json,
+        "save_database": (
+            context.save_database
+        ),
+        "chunk_max_length": (
+            context.chunk_max_length
+        ),
+    }
+
+
+def build_pipeline_router(
+    context: RuntimeContext,
+) -> PipelineRouter:
+    """
+    创建统一 PipelineRouter。
+
+    Main 不再自己维护：
+
+        extension -> Pipeline
+
+    映射，也不再直接调用 PipelineFactory。
+    """
+
+    return PipelineRouter(
+        output_directory=(
+            context.output_directory
+        ),
+        overwrite_output=True,
+        pipeline_kwargs=(
+            build_pipeline_kwargs(
+                context
             )
-            and PipelineFactory.supports(
-                file
-            )
-        )
-    ]
-
-    return sorted(
-        files,
-        key=lambda file: (
-            file.suffix.lower(),
-            file.name.lower(),
         ),
     )
 
 
-def build_pipeline_kwargs() -> dict:
-    """
-    构建统一 Pipeline 初始化参数。
-
-    当前所有 Pipeline 共用：
-
-        save_json
-        save_database
-        chunk_max_length
-    """
-
-    return {
-        "save_json": SAVE_JSON,
-        "save_database": SAVE_DATABASE,
-        "chunk_max_length": CHUNK_MAX_LENGTH,
-    }
+# =====================
+# Presentation
+# =====================
 
 
-def process_file(
-    file_path: Path,
-) -> bool:
-    """
-    处理单个文档。
-
-    Args:
-        file_path:
-            输入文档路径。
-
-    Returns:
-        True:
-            成功。
-
-        False:
-            失败。
-    """
-
-    output_path = (
-        OUTPUT_DIR
-        / f"{file_path.stem}.json"
-    )
-
-    print()
-    print("====================")
-    print(
-        f"Processing: {file_path.name}"
-    )
-    print("====================")
-
-    LOGGER.info(
-        "Processing started | file=%s",
-        file_path,
-    )
-
-    try:
-        pipeline = (
-            PipelineFactory.create(
-                file_path,
-                **build_pipeline_kwargs(),
-            )
-        )
-
-        pipeline_name = (
-            pipeline.__class__.__name__
-        )
-
-        print(
-            "Pipeline:",
-            pipeline_name,
-        )
-
-        print(
-            "JSON:",
-            (
-                "Enabled"
-                if SAVE_JSON
-                else "Disabled"
-            ),
-        )
-
-        print(
-            "PostgreSQL:",
-            (
-                "Enabled"
-                if SAVE_DATABASE
-                else "Disabled"
-            ),
-        )
-
-        print(
-            "Chunk max length:",
-            CHUNK_MAX_LENGTH,
-        )
-
-        LOGGER.info(
-            "Pipeline selected | "
-            "file=%s | "
-            "pipeline=%s | "
-            "save_json=%s | "
-            "save_database=%s | "
-            "chunk_max_length=%s",
-            file_path.name,
-            pipeline_name,
-            SAVE_JSON,
-            SAVE_DATABASE,
-            CHUNK_MAX_LENGTH,
-        )
-
-        document = pipeline.run(
-            file_path=file_path,
-            output=output_path,
-        )
-
-        print("Completed")
-
-        print(
-            "Pages:",
-            len(document.pages),
-        )
-
-        print(
-            "Chapters:",
-            len(document.chapters),
-        )
-
-        print(
-            "Sections:",
-            len(document.sections),
-        )
-
-        print(
-            "Contents:",
-            len(document.contents),
-        )
-
-        if SAVE_JSON:
-            print(
-                "Output:",
-                output_path,
-            )
-
-        if SAVE_DATABASE:
-            print(
-                "Database:",
-                "Saved",
-            )
-
-        LOGGER.info(
-            "Processing completed | "
-            "file=%s | "
-            "pipeline=%s | "
-            "pages=%s | "
-            "chapters=%s | "
-            "sections=%s | "
-            "contents=%s | "
-            "save_json=%s | "
-            "save_database=%s | "
-            "output=%s",
-            file_path.name,
-            pipeline_name,
-            len(document.pages),
-            len(document.chapters),
-            len(document.sections),
-            len(document.contents),
-            SAVE_JSON,
-            SAVE_DATABASE,
-            output_path,
-        )
-
-        return True
-
-    except Exception as exc:
-        print(
-            f"Failed: {file_path.name}"
-        )
-
-        print(exc)
-
-        LOGGER.error(
-            "Processing failed | "
-            "file=%s | "
-            "error=%s",
-            file_path.name,
-            exc,
-        )
-
-        LOGGER.debug(
-            traceback.format_exc()
-        )
-
-        return False
-
-
-def print_runtime_information() -> None:
+def print_runtime_information(
+    context: RuntimeContext,
+) -> None:
     """
     输出当前运行环境与应用配置。
 
-    注意：
-        不打印数据库密码。
+    不输出数据库密码。
     """
 
     runtime_mode = (
@@ -446,7 +326,7 @@ def print_runtime_information() -> None:
         "========================================"
     )
     print(
-        CONFIG.application.name
+        context.config.application.name
     )
     print(
         "========================================"
@@ -459,34 +339,35 @@ def print_runtime_information() -> None:
 
     print(
         "Environment:",
-        CONFIG.application.environment,
+        context.config.application.environment,
     )
 
     print(
         "Base directory:",
-        BASE_DIR,
+        context.base_directory,
     )
 
     print(
         "Input directory:",
-        INPUT_DIR,
+        context.input_directory,
     )
 
-    print(
-        "Output directory:",
-        OUTPUT_DIR,
-    )
+    if context.save_json:
+        print(
+            "Output directory:",
+            context.output_directory,
+        )
 
     print(
         "Log directory:",
-        LOG_DIR,
+        context.log_directory,
     )
 
     print(
         "JSON:",
         (
             "Enabled"
-            if SAVE_JSON
+            if context.save_json
             else "Disabled"
         ),
     )
@@ -495,47 +376,117 @@ def print_runtime_information() -> None:
         "PostgreSQL:",
         (
             "Enabled"
-            if SAVE_DATABASE
+            if context.save_database
             else "Disabled"
         ),
     )
 
-    if SAVE_DATABASE:
+    if context.save_database:
         print(
             "DB Host:",
-            CONFIG.database.host,
+            context.config.database.host,
         )
 
         print(
             "DB Port:",
-            CONFIG.database.port,
+            context.config.database.port,
         )
 
         print(
             "DB Name:",
-            CONFIG.database.database,
+            context.config.database.database,
         )
 
         print(
             "DB User:",
-            CONFIG.database.user,
+            context.config.database.user,
         )
 
     print(
         "Chunk max length:",
-        CHUNK_MAX_LENGTH,
-    )
-
-    print(
-        "Supported formats:",
-        ", ".join(
-            PipelineFactory
-            .supported_extensions()
-        ),
+        context.chunk_max_length,
     )
 
     print(
         "========================================"
+    )
+
+
+def print_success_result(
+    result: PipelineRouteResult,
+    *,
+    save_json: bool,
+    save_database: bool,
+) -> None:
+    """
+    输出单文件成功结果。
+    """
+
+    document = result.document
+
+    print()
+    print("====================")
+    print(
+        f"Completed: {result.input_path.name}"
+    )
+    print("====================")
+
+    print(
+        "Pipeline:",
+        result.pipeline_name,
+    )
+
+    print(
+        "Pages:",
+        len(document.pages),
+    )
+
+    print(
+        "Chapters:",
+        len(document.chapters),
+    )
+
+    print(
+        "Sections:",
+        len(document.sections),
+    )
+
+    print(
+        "Contents:",
+        len(document.contents),
+    )
+
+    if save_json:
+        print(
+            "Output:",
+            result.output_path,
+        )
+
+    if save_database:
+        print(
+            "Database:",
+            "Saved",
+        )
+
+
+def print_failure_result(
+    *,
+    input_path: Path,
+    error: Exception,
+) -> None:
+    """
+    输出单文件失败结果。
+    """
+
+    print()
+    print("====================")
+    print(
+        f"Failed: {input_path.name}"
+    )
+    print("====================")
+
+    print(
+        f"{type(error).__name__}: {error}"
     )
 
 
@@ -544,6 +495,7 @@ def print_batch_summary(
     success_count: int,
     failure_count: int,
     total_count: int,
+    context: RuntimeContext,
 ) -> None:
     """
     输出批处理汇总。
@@ -573,7 +525,7 @@ def print_batch_summary(
         "JSON:",
         (
             "Enabled"
-            if SAVE_JSON
+            if context.save_json
             else "Disabled"
         ),
     )
@@ -582,10 +534,58 @@ def print_batch_summary(
         "PostgreSQL:",
         (
             "Enabled"
-            if SAVE_DATABASE
+            if context.save_database
             else "Disabled"
         ),
     )
+
+
+# =====================
+# Error Logging
+# =====================
+
+
+def log_failure_traceback(
+    *,
+    input_path: Path,
+    error: Exception,
+) -> None:
+    """
+    将保存于异常对象上的 traceback 写入 debug log。
+
+    PipelineRouter 批处理会把异常对象放入
+    PipelineFailureResult，因此这里不需要丢失底层栈信息。
+    """
+
+    LOGGER.error(
+        "Processing failed | "
+        "file=%s | "
+        "error_type=%s | "
+        "error=%s",
+        input_path.name,
+        type(error).__name__,
+        error,
+    )
+
+    trace = "".join(
+        traceback.format_exception(
+            type(error),
+            error,
+            error.__traceback__,
+        )
+    )
+
+    LOGGER.debug(
+        "Processing traceback | "
+        "file=%s\n%s",
+        input_path.name,
+        trace,
+    )
+
+
+# =====================
+# Exit
+# =====================
 
 
 def wait_before_exit() -> None:
@@ -610,6 +610,11 @@ def wait_before_exit() -> None:
         pass
 
 
+# =====================
+# Main
+# =====================
+
+
 def main() -> None:
     """
     Document Ingestion Platform 主入口。
@@ -618,28 +623,39 @@ def main() -> None:
 
         Config
             ↓
-
+        RuntimeContext
+            ↓
         Runtime Directories
             ↓
-
-        Input Discovery
+        PipelineRouter
             ↓
-
+        FormatRouter
+            ↓
         PipelineFactory
             ↓
-
         PDF / DOCX / PPTX / XLSX Pipeline
             ↓
-
-        JSON
-            +
-        PostgreSQL
+        JSON / PostgreSQL
     """
 
-    ensure_directories()
-    configure_logging()
+    # 配置只在真正启动时读取。
+    config = load_application_config()
 
-    print_runtime_information()
+    context = build_runtime_context(
+        config
+    )
+
+    ensure_directories(
+        context
+    )
+
+    configure_logging(
+        context
+    )
+
+    print_runtime_information(
+        context
+    )
 
     LOGGER.info(
         "Application started."
@@ -656,93 +672,160 @@ def main() -> None:
 
     LOGGER.info(
         "Environment: %s",
-        CONFIG.application.environment,
+        context.config.application.environment,
     )
 
     LOGGER.info(
         "Base directory: %s",
-        BASE_DIR,
+        context.base_directory,
     )
 
     LOGGER.info(
         "Input directory: %s",
-        INPUT_DIR,
+        context.input_directory,
     )
 
-    LOGGER.info(
-        "Output directory: %s",
-        OUTPUT_DIR,
-    )
+    if context.save_json:
+        LOGGER.info(
+            "Output directory: %s",
+            context.output_directory,
+        )
 
     LOGGER.info(
         "Log directory: %s",
-        LOG_DIR,
+        context.log_directory,
     )
 
     LOGGER.info(
         "JSON enabled: %s",
-        SAVE_JSON,
+        context.save_json,
     )
 
     LOGGER.info(
         "PostgreSQL enabled: %s",
-        SAVE_DATABASE,
+        context.save_database,
     )
 
     LOGGER.info(
         "Chunk max length: %s",
-        CHUNK_MAX_LENGTH,
+        context.chunk_max_length,
     )
 
-    files = (
-        discover_input_files()
+    router = build_pipeline_router(
+        context
     )
 
-    if not files:
+    # PipelineRouter 统一负责：
+    #
+    #     - 文件发现
+    #     - 格式支持判断
+    #     - FormatRouter
+    #     - PipelineFactory
+    #     - 单文件错误隔离
+    #     - 输出路径生成
+    #
+    # Main 只负责应用层展示与汇总。
+    (
+        success_results,
+        failed_results,
+    ) = router.execute_directory(
+        context.input_directory,
+        recursive=False,
+        continue_on_error=True,
+    )
+
+    total_count = (
+        len(success_results)
+        + len(failed_results)
+    )
+
+    if total_count == 0:
         message = (
             "No supported input files found. "
-            f"Input directory: {INPUT_DIR}"
+            "Input directory: "
+            f"{context.input_directory}"
         )
 
         print()
-        print(message)
+        print(
+            message
+        )
 
         LOGGER.warning(
             message
         )
 
         wait_before_exit()
+
         return
 
     LOGGER.info(
-        "Discovered %s supported files.",
-        len(files),
+        "Batch processed | "
+        "success=%s | "
+        "failed=%s | "
+        "total=%s",
+        len(success_results),
+        len(failed_results),
+        total_count,
     )
 
-    for file_path in files:
-        LOGGER.debug(
-            "Discovered input file: %s",
-            file_path.name,
+    for result in success_results:
+        print_success_result(
+            result,
+            save_json=context.save_json,
+            save_database=(
+                context.save_database
+            ),
         )
 
-    success_count = 0
-    failure_count = 0
+        document = result.document
 
-    for file_path in files:
-        success = process_file(
-            file_path
+        LOGGER.info(
+            "Processing completed | "
+            "file=%s | "
+            "pipeline=%s | "
+            "pages=%s | "
+            "chapters=%s | "
+            "sections=%s | "
+            "contents=%s | "
+            "save_json=%s | "
+            "save_database=%s | "
+            "output=%s",
+            result.input_path.name,
+            result.pipeline_name,
+            len(document.pages),
+            len(document.chapters),
+            len(document.sections),
+            len(document.contents),
+            context.save_json,
+            context.save_database,
+            (
+                result.output_path
+                if context.save_json
+                else "<disabled>"
+            ),
         )
 
-        if success:
-            success_count += 1
+    for failure in failed_results:
+        print_failure_result(
+            input_path=failure.input_path,
+            error=failure.error,
+        )
 
-        else:
-            failure_count += 1
+        log_failure_traceback(
+            input_path=failure.input_path,
+            error=failure.error,
+        )
 
     print_batch_summary(
-        success_count=success_count,
-        failure_count=failure_count,
-        total_count=len(files),
+        success_count=len(
+            success_results
+        ),
+        failure_count=len(
+            failed_results
+        ),
+        total_count=total_count,
+        context=context,
     )
 
     LOGGER.info(
@@ -750,9 +833,9 @@ def main() -> None:
         "success=%s | "
         "failed=%s | "
         "total=%s",
-        success_count,
-        failure_count,
-        len(files),
+        len(success_results),
+        len(failed_results),
+        total_count,
     )
 
     wait_before_exit()
@@ -767,7 +850,9 @@ if __name__ == "__main__":
         print(
             "Configuration Error:"
         )
-        print(exc)
+        print(
+            exc
+        )
 
         if IS_FROZEN:
             try:

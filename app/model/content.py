@@ -1,17 +1,70 @@
-from pydantic import BaseModel
-from typing import Optional
+from __future__ import annotations
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+)
 
 
 class Content(BaseModel):
+    """
+    文档内容单元。
 
-    chapter_id: Optional[str] = None
+    Content 可以属于：
+        - Chapter
+        - Section
+        - Chapter + Section
 
-    section_id: Optional[str] = None
+    在 Parser 中间阶段也允许：
+        chapter_id=None
+        section_id=None
+
+    后续由 ContentFilter 决定是否删除孤立内容。
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+    )
+
+    # =====================
+    # Structure
+    # =====================
+
+    chapter_id: str | None = None
+
+    section_id: str | None = None
+
+    # =====================
+    # Content
+    # =====================
 
     text: str
 
-    page_number: Optional[int] = None
+    # =====================
+    # Location
+    # =====================
 
-    chunk_index: int = 0
+    page_number: int | None = Field(
+        default=None,
+        ge=1,
+    )
 
-    token_count: int = 0
+    # =====================
+    # Chunk
+    # =====================
+
+    chunk_index: int = Field(
+        default=0,
+        ge=0,
+    )
+
+    # =====================
+    # Token
+    # =====================
+
+    token_count: int = Field(
+        default=0,
+        ge=0,
+    )

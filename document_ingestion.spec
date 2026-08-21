@@ -11,12 +11,18 @@ from PyInstaller.utils.hooks import (
 project_root = Path(SPEC).resolve().parent
 
 
+# ============================================================
+# Hidden Imports
+# ============================================================
+
 hiddenimports: list[str] = []
 
+# Project modules
 hiddenimports += collect_submodules(
     "app"
 )
 
+# Document libraries
 hiddenimports += collect_submodules(
     "pptx"
 )
@@ -25,6 +31,11 @@ hiddenimports += collect_submodules(
     "openpyxl"
 )
 
+hiddenimports += collect_submodules(
+    "docx"
+)
+
+# Pipelines
 hiddenimports += [
     "app.pipeline.pdf_pipeline",
     "app.pipeline.docx_pipeline",
@@ -32,82 +43,119 @@ hiddenimports += [
     "app.pipeline.xlsx_pipeline",
 ]
 
+# PostgreSQL
+hiddenimports += collect_submodules(
+    "psycopg"
+)
+
+
+# ============================================================
+# Datas / Binaries
+# ============================================================
 
 datas = []
 binaries = []
 
 
+def collect_package(
+    package_name: str,
+) -> None:
+    """
+    Collect package datas, binaries and hidden imports.
+    """
+
+    global datas
+    global binaries
+    global hiddenimports
+
+    package_datas, package_binaries, package_hiddenimports = (
+        collect_all(
+            package_name
+        )
+    )
+
+    datas += package_datas
+    binaries += package_binaries
+    hiddenimports += package_hiddenimports
+
+
+# ============================================================
 # python-pptx
-pptx_datas, pptx_binaries, pptx_hiddenimports = (
-    collect_all(
-        "pptx"
-    )
+# ============================================================
+
+collect_package(
+    "pptx"
 )
 
-datas += pptx_datas
-binaries += pptx_binaries
-hiddenimports += pptx_hiddenimports
 
-
+# ============================================================
 # openpyxl
-openpyxl_datas, openpyxl_binaries, openpyxl_hiddenimports = (
-    collect_all(
-        "openpyxl"
-    )
+# ============================================================
+
+collect_package(
+    "openpyxl"
 )
 
-datas += openpyxl_datas
-binaries += openpyxl_binaries
-hiddenimports += openpyxl_hiddenimports
 
-
-# PyMuPDF
-try:
-    fitz_datas, fitz_binaries, fitz_hiddenimports = (
-        collect_all(
-            "fitz"
-        )
-    )
-
-    datas += fitz_datas
-    binaries += fitz_binaries
-    hiddenimports += fitz_hiddenimports
-
-except Exception:
-    pass
-
-
+# ============================================================
 # python-docx
-try:
-    docx_datas, docx_binaries, docx_hiddenimports = (
-        collect_all(
-            "docx"
-        )
-    )
+# ============================================================
 
-    datas += docx_datas
-    binaries += docx_binaries
-    hiddenimports += docx_hiddenimports
+collect_package(
+    "docx"
+)
+
+
+# ============================================================
+# PyMuPDF
+# ============================================================
+
+try:
+    collect_package(
+        "fitz"
+    )
 
 except Exception:
     pass
 
 
-# PostgreSQL driver
-try:
-    psycopg_datas, psycopg_binaries, psycopg_hiddenimports = (
-        collect_all(
-            "psycopg"
-        )
-    )
+# ============================================================
+# psycopg 3
+# ============================================================
 
-    datas += psycopg_datas
-    binaries += psycopg_binaries
-    hiddenimports += psycopg_hiddenimports
+try:
+    collect_package(
+        "psycopg"
+    )
 
 except Exception:
     pass
 
+
+# ============================================================
+# Application config
+# ============================================================
+
+config_file = (
+    project_root
+    / "config"
+    / "config.yaml"
+)
+
+if config_file.exists():
+    datas.append(
+        (
+            str(
+                config_file
+            ),
+            "config",
+        )
+    )
+
+
+# ============================================================
+# Deduplicate hidden imports
+# ============================================================
 
 hiddenimports = sorted(
     set(
@@ -116,12 +164,17 @@ hiddenimports = sorted(
 )
 
 
+# ============================================================
+# Analysis
+# ============================================================
+
 analysis = Analysis(
     [
         str(
             project_root
             / "app"
-            / "main.py"
+            / "gui"
+            / "application.py"
         )
     ],
     pathex=[
@@ -136,45 +189,52 @@ analysis = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        "tkinter",
+        # 当前 EXE 不做 Embedding / Qdrant / LLM
+        "torch",
+        "transformers",
+        "sentence_transformers",
+        "qdrant_client",
+
+        # 无关开发依赖
         "matplotlib",
         "notebook",
         "IPython",
+
+        # 旧 PostgreSQL driver
+        "psycopg2",
     ],
     noarchive=False,
     optimize=0,
 )
 
 
+# ============================================================
+# Python Archive
+# ============================================================
+
 pyz = PYZ(
     analysis.pure
 )
 
 
+# ============================================================
+# OneFile EXE
+# ============================================================
+
 exe = EXE(
     pyz,
     analysis.scripts,
+    analysis.binaries,
+    analysis.datas,
     [],
-    exclude_binaries=True,
     name="DocumentIngestion",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+
+    # GUI application
+    console=False,
+
     disable_windowed_traceback=False,
-)
-
-hiddenimports += collect_submodules(
-    "psycopg2"
-)
-
-collection = COLLECT(
-    exe,
-    analysis.binaries,
-    analysis.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="DocumentIngestion",
 )

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+)
 
 
 class Chapter(BaseModel):
@@ -15,11 +19,18 @@ class Chapter(BaseModel):
         8  Performance
     """
 
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+    )
+
     # =====================
     # Identity
     # =====================
 
-    id: str
+    id: str = Field(
+        min_length=1,
+    )
 
     # =====================
     # Titles
@@ -33,20 +44,29 @@ class Chapter(BaseModel):
     # Structure
     # =====================
 
-    level: int = 1
+    level: int = Field(
+        default=1,
+        ge=1,
+    )
 
-    sort_order: int = 0
+    sort_order: int = Field(
+        default=0,
+        ge=0,
+    )
 
     # =====================
     # Location
     # =====================
 
-    page_number: int | None = None
+    page_number: int | None = Field(
+        default=None,
+        ge=1,
+    )
 
     # =====================
     # Metadata
     # =====================
 
     metadata: dict[str, Any] = Field(
-        default_factory=dict
+        default_factory=dict,
     )

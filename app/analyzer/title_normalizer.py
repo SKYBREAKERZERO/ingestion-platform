@@ -1,138 +1,200 @@
+from __future__ import annotations
+
+import re
+import unicodedata
+
+
 class TitleNormalizer:
+    """
+    PDF 结构分析前的文本标准化器。
 
+    职责：
+        - Unicode NFKC 标准化
+        - 全角数字 / 英文 / 标点标准化
+        - 清理不可见字符
+        - 清理控制字符
+        - 合并行内重复空格
+        - 规范化章节编号中的点号和空格
+        - 保留原始行边界
 
-    def normalize(self, text):
+    不负责：
+        - 判断 Chapter / Section
+        - 合并断行标题
+        - 推测正文是否属于标题
+        - 建立章节层级
 
+    标题断行合并统一交给：
+        TitleJoiner
+    """
 
-        lines = [
+    _CONTROL_CHARACTER_PATTERN = re.compile(
+        r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"
+    )
 
-            x.strip()
+    _MULTIPLE_HORIZONTAL_SPACES_PATTERN = re.compile(
+        r"[ \t]+"
+    )
 
-            for x in text.splitlines()
+    _NUMBER_DOT_SPACING_PATTERN = re.compile(
+        r"(?<=\d)\s*\.\s*(?=\d)"
+    )
 
-            if x.strip()
+    _LEADING_TRAILING_SPACES_PATTERN = re.compile(
+        r"^[ \t]+|[ \t]+$"
+    )
 
-        ]
+    _ZERO_WIDTH_CHARACTERS = (
+        "\u200b",  # Zero Width Space
+        "\u200c",  # Zero Width Non-Joiner
+        "\u200d",  # Zero Width Joiner
+        "\u2060",  # Word Joiner
+        "\ufeff",  # BOM / Zero Width No-Break Space
+    )
 
-
-        result=[]
-
-
-        i=0
-
-
-
-        while i < len(lines):
-
-
-            current = lines[i]
-
-
-
-            # 日文字符断行
-
-            if i + 1 < len(lines):
-
-
-                nxt = lines[i+1]
-
-
-
-                if self.should_merge(
-
-                    current,
-
-                    nxt
-
-                ):
-
-
-                    current += nxt
-
-                    i += 1
-
-
-
-            result.append(current)
-
-
-            i += 1
-
-
-
-        return "\n".join(result)
-
-
-
-    def should_merge(
-
+    def normalize(
         self,
+        text: str,
+    ) -> str:
+        """
+        标准化多行 PDF 文本，同时保留逻辑行边界。
 
-        current,
+        Args:
+            text:
+                PDF Page 提取出的原始文本。
 
-        next_line
+        Returns:
+            标准化后的多行文本。
+        """
 
-    ):
+        if text is None:
+            raise ValueError(
+                "TitleNormalizer text cannot be None."
+            )
 
-
-        # 当前行太长不处理
-
-        if len(current) > 25:
-
-            return False
-
-
-
-        # 下一行太长不处理
-
-        if len(next_line) > 25:
-
-            return False
-
-
-
-        # 当前没有结束符
-
-        if current.endswith(
-
-            ("。","．",".","！","？")
-
+        if not isinstance(
+            text,
+            str,
         ):
+            raise TypeError(
+                "TitleNormalizer expects a string. "
+                f"Received: {type(text).__name__}"
+            )
 
-            return False
+        if not text:
+            return ""
 
+        normalized_text = self._normalize_line_endings(
+            text
+        )
 
+        normalized_lines: list[str] = []
 
-        # 下一行不是章节
+        for raw_line in normalized_text.splitlines():
 
-        import re
+            line = self.normalize_line(
+                raw_line
+            )
 
+            if not line:
+                continue
 
-        if re.match(
+            normalized_lines.append(
+                line
+            )
 
-            r"^[0-9０-９]+[\.．]",
+        return "\n".join(
+            normalized_lines
+        )
 
-            next_line
+    @classmethod
+    def normalize_line(
+        cls,
+        text: str,
+    ) -> str:
+        """
+        标准化单行文本。
 
+        Example:
+
+            １．２　User　Profile
+
+        ->
+
+            1.2 User Profile
+        """
+
+        if not text:
+            return ""
+
+        normalized = unicodedata.normalize(
+            "NFKC",
+            text,
+        )
+
+        normalized = normalized.replace(
+            "\u00a0",
+            " ",
+        )
+
+        normalized = normalized.replace(
+            "\u3000",
+            " ",
+        )
+
+        for character in (
+            cls._ZERO_WIDTH_CHARACTERS
         ):
+            normalized = normalized.replace(
+                character,
+                "",
+            )
 
-            return False
+        normalized = (
+            cls._CONTROL_CHARACTER_PATTERN.sub(
+                "",
+                normalized,
+            )
+        )
 
+        normalized = (
+            cls._MULTIPLE_HORIZONTAL_SPACES_PATTERN.sub(
+                " ",
+                normalized,
+            )
+        )
 
+        normalized = (
+            cls._NUMBER_DOT_SPACING_PATTERN.sub(
+                ".",
+                normalized,
+            )
+        )
 
-        # 日文断词
+        normalized = (
+            cls._LEADING_TRAILING_SPACES_PATTERN.sub(
+                "",
+                normalized,
+            )
+        )
 
-        if (
+        return normalized.strip()
 
-            current[-1:].isascii()
+    @staticmethod
+    def _normalize_line_endings(
+        text: str,
+    ) -> str:
+        """
+        Windows / Unix / legacy Mac 换行统一为 \\n。
+        """
 
-            == False
-
-        ):
-
-
-            return True
-
-
-
-        return False
+        return (
+            text
+            .replace(
+                "\r\n",
+                "\n",
+            )
+            .replace(
+                "\r",
+                "\n",
+            )
+        )
