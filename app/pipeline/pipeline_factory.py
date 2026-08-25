@@ -99,12 +99,15 @@ class PipelineFactory:
         - PDF
         - DOCX
         - PPTX
+        - PPT
         - XLSX
+        - TXT
+        - PNG
+        - JPG
+        - JPEG
 
     明确不支持：
-        - PPT
         - XLS
-        - TXT
         - HTML
         - XML
         - CSV
@@ -147,6 +150,35 @@ class PipelineFactory:
             extensions=frozenset(
                 {
                     ".pptx",
+                }
+            ),
+        ),
+        "ppt": PipelineSpec(
+            module_path="app.pipeline.ppt_pipeline",
+            class_name="PPTPipeline",
+            extensions=frozenset(
+                {
+                    ".ppt",
+                }
+            ),
+        ),
+        "txt": PipelineSpec(
+            module_path="app.pipeline.txt_pipeline",
+            class_name="TXTPipeline",
+            extensions=frozenset(
+                {
+                    ".txt",
+                }
+            ),
+        ),
+        "image": PipelineSpec(
+            module_path="app.pipeline.image_pipeline",
+            class_name="ImagePipeline",
+            extensions=frozenset(
+                {
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
                 }
             ),
         ),

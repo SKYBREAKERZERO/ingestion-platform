@@ -68,12 +68,15 @@ class FormatRouter:
         - PDF
         - DOCX
         - PPTX
+        - PPT
         - XLSX
+        - TXT
+        - PNG
+        - JPG
+        - JPEG
 
     明确不支持：
-        - PPT
         - XLS
-        - TXT
         - CSV
         - Markdown
         - HTML
@@ -115,6 +118,36 @@ class FormatRouter:
                 "presentationml.presentation"
             ),
             pipeline_key="pptx",
+        ),
+        ".ppt": FormatRoute(
+            extension=".ppt",
+            format_name="ppt",
+            media_type="application/vnd.ms-powerpoint",
+            pipeline_key="ppt",
+        ),
+        ".txt": FormatRoute(
+            extension=".txt",
+            format_name="txt",
+            media_type="text/plain",
+            pipeline_key="txt",
+        ),
+        ".png": FormatRoute(
+            extension=".png",
+            format_name="png",
+            media_type="image/png",
+            pipeline_key="image",
+        ),
+        ".jpg": FormatRoute(
+            extension=".jpg",
+            format_name="jpg",
+            media_type="image/jpeg",
+            pipeline_key="image",
+        ),
+        ".jpeg": FormatRoute(
+            extension=".jpeg",
+            format_name="jpeg",
+            media_type="image/jpeg",
+            pipeline_key="image",
         ),
     }
 
