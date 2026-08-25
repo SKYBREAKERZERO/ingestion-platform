@@ -1,9 +1,0 @@
-# Format extension dependencies
-#
-# OCR:
-rapidocr==3.9.2
-onnxruntime
-Pillow
-
-# Legacy .ppt conversion through Microsoft PowerPoint COM:
-pywin32
