@@ -6,6 +6,7 @@ from typing import Iterator
 
 from docx import Document as WordDocument
 from docx.document import Document as WordDocumentType
+from docx.oxml.ns import qn
 from docx.oxml.table import CT_Tbl
 from docx.oxml.text.paragraph import CT_P
 from docx.table import Table
@@ -28,16 +29,25 @@ class DOCXLoaderError(RuntimeError):
 
 class DOCXLoader(BaseLoader):
     """
-    DOCX 原始内容加载器。
+    DOCX 企业级原始结构加载器。
 
     负责：
-        - 按 Word 原始顺序读取段落和表格
-        - 保留标题样式和标题层级
-        - 保留表格 Cell 列位置
+        - 按 Word document.xml 原始顺序读取 Paragraph / Table
+        - 尽量无损保留表格 Cell 列位置
         - 保留重复 Cell
+        - 保留 0 / False 等文本化后的有效值
+        - 保留 Word Style 信息
+        - 多信号识别 Heading 层级
+        - 保存 Heading 层级来源与冲突信息
         - 输出统一 Document.pages
         - 输出结构化 Document.blocks
-        - 保存基础元数据
+        - 保存 Loader Metadata
+
+    Heading 层级识别来源：
+        1. Paragraph outlineLvl
+        2. Style outlineLvl
+        3. Heading style name / style id
+        4. Numbering ilvl 作为 Heading 的辅助信号
 
     不负责：
         - Chapter / Section 建模
@@ -49,27 +59,41 @@ class DOCXLoader(BaseLoader):
         - JSON / PostgreSQL 保存
 
     设计原则：
-        Loader 负责尽量无损地读取原始结构。
+        Loader 只负责“读取”和“保存来源信息”，
+        不提前执行不可逆的业务语义删除。
 
-        是否删除：
-            - 空 Cell
-            - 重复 Cell
-            - 空段落
-            - 噪声
+    关于 page_number：
+        python-docx 无法可靠提供 Word 最终排版后的物理页码。
 
-        应交给后续 Filter 决定。
+        因此：
+            DocumentBlock.page_number = None
 
-        Loader 不应提前做不可恢复的数据删除。
+        Document.pages 仍保留一个逻辑 Page(page_number=1)，
+        仅用于兼容现有统一 Document 模型。
+
+        真实物理页码不可用时，宁可返回 None，
+        不把所有正文错误标记成第 1 页。
     """
 
     # ==================================================
     # Heading Style
     # ==================================================
 
-    _HEADING_STYLE_PATTERN = re.compile(
+    _HEADING_STYLE_NAME_PATTERN = re.compile(
         r"^(?:heading|見出し|标题|標題)\s*([1-9]\d*)$",
         re.IGNORECASE,
     )
+
+    _HEADING_STYLE_ID_PATTERN = re.compile(
+        r"^heading([1-9]\d*)$",
+        re.IGNORECASE,
+    )
+
+    # Word outlineLvl / numPr ilvl 是 0-based。
+    _MIN_HEADING_LEVEL = 1
+
+    # 防御异常文档，避免极端 outlineLvl 污染后续结构。
+    _MAX_HEADING_LEVEL = 9
 
     # ==================================================
     # Public API
@@ -144,6 +168,12 @@ class DOCXLoader(BaseLoader):
         empty_table_cell_count = 0
         table_cell_count = 0
 
+        style_heading_count = 0
+        paragraph_outline_heading_count = 0
+        style_outline_heading_count = 0
+        numbering_assisted_heading_count = 0
+        heading_level_conflict_count = 0
+
         order = 0
 
         # ==============================================
@@ -167,10 +197,10 @@ class DOCXLoader(BaseLoader):
                     raw_block.text
                 )
 
-                # 当前 Loader 不建立空 Paragraph Block。
+                # 空 Paragraph 不建立 Block。
                 #
-                # 空段落通常只承担 Word 排版作用，
-                # 对后续 RAG 没有检索价值。
+                # 这里仅删除完全无文本内容的排版段落，
+                # 不删除任何有实际文本的 Paragraph。
                 if not text:
                     continue
 
@@ -180,11 +210,68 @@ class DOCXLoader(BaseLoader):
                     )
                 )
 
-                heading_level = (
-                    self._get_heading_level(
-                        style_name
+                style_id = (
+                    self._get_style_id(
+                        raw_block
                     )
                 )
+
+                # ======================================
+                # Heading Signals
+                # ======================================
+
+                style_heading_level = (
+                    self._get_style_heading_level(
+                        style_name=style_name,
+                        style_id=style_id,
+                    )
+                )
+
+                paragraph_outline_level = (
+                    self._get_paragraph_outline_heading_level(
+                        raw_block
+                    )
+                )
+
+                style_outline_level = (
+                    self._get_style_outline_heading_level(
+                        raw_block
+                    )
+                )
+
+                numbering_level = (
+                    self._get_numbering_level(
+                        raw_block
+                    )
+                )
+
+                numbering_id = (
+                    self._get_numbering_id(
+                        raw_block
+                    )
+                )
+
+                (
+                    heading_level,
+                    heading_level_source,
+                    heading_level_conflict,
+                ) = self._resolve_heading_level(
+                    style_heading_level=(
+                        style_heading_level
+                    ),
+                    paragraph_outline_level=(
+                        paragraph_outline_level
+                    ),
+                    style_outline_level=(
+                        style_outline_level
+                    ),
+                    numbering_level=(
+                        numbering_level
+                    ),
+                )
+
+                if heading_level_conflict:
+                    heading_level_conflict_count += 1
 
                 # ======================================
                 # Block Type
@@ -197,6 +284,34 @@ class DOCXLoader(BaseLoader):
                     )
 
                     heading_count += 1
+
+                    if (
+                        heading_level_source
+                        == "paragraph_outline"
+                    ):
+
+                        paragraph_outline_heading_count += 1
+
+                    elif (
+                        heading_level_source
+                        == "style_outline"
+                    ):
+
+                        style_outline_heading_count += 1
+
+                    elif (
+                        heading_level_source
+                        == "style"
+                    ):
+
+                        style_heading_count += 1
+
+                    elif (
+                        heading_level_source
+                        == "numbering_assisted"
+                    ):
+
+                        numbering_assisted_heading_count += 1
 
                 elif self._is_list_paragraph(
                     raw_block
@@ -215,7 +330,7 @@ class DOCXLoader(BaseLoader):
                     )
 
                 # ======================================
-                # Block
+                # Paragraph Block
                 # ======================================
 
                 block = DocumentBlock(
@@ -224,9 +339,56 @@ class DOCXLoader(BaseLoader):
                     level=heading_level,
                     style_name=style_name,
                     order=order,
+
+                    # DOCX 无可靠物理页码。
+                    page_number=None,
+
                     source="docx",
+
                     metadata={
-                        "source": "paragraph",
+                        "source": (
+                            "paragraph"
+                        ),
+
+                        "style_name": (
+                            style_name
+                        ),
+
+                        "style_id": (
+                            style_id
+                        ),
+
+                        "style_heading_level": (
+                            style_heading_level
+                        ),
+
+                        "paragraph_outline_heading_level": (
+                            paragraph_outline_level
+                        ),
+
+                        "style_outline_heading_level": (
+                            style_outline_level
+                        ),
+
+                        "numbering_level": (
+                            numbering_level
+                        ),
+
+                        "numbering_id": (
+                            numbering_id
+                        ),
+
+                        "heading_level_source": (
+                            heading_level_source
+                        ),
+
+                        "heading_level_conflict": (
+                            heading_level_conflict
+                        ),
+
+                        "physical_page_number_available": (
+                            False
+                        ),
                     },
                 )
 
@@ -269,8 +431,6 @@ class DOCXLoader(BaseLoader):
                     # Extract Cells
                     # ==================================
                     #
-                    # 注意：
-                    #
                     # 不删除空 Cell。
                     # 不删除重复 Cell。
                     #
@@ -296,11 +456,6 @@ class DOCXLoader(BaseLoader):
                     # ==================================
                     # Completely Empty Row
                     # ==================================
-                    #
-                    # 空行没有建立 Block 的必要。
-                    #
-                    # 但只要存在任意 Cell 内容，
-                    # 就必须完整保留所有 Cell 位置。
 
                     if not any(
                         values
@@ -318,30 +473,46 @@ class DOCXLoader(BaseLoader):
                     )
 
                     # ==================================
-                    # Block
+                    # Table Block
                     # ==================================
 
                     block = DocumentBlock(
                         block_type=BlockType.TABLE,
+
                         text=row_text,
+
                         order=order,
+
                         table_index=(
                             current_table_index
                         ),
+
                         row_index=row_index,
+
                         cells=values,
+
+                        # DOCX 无可靠物理页码。
+                        page_number=None,
+
                         source="docx",
+
                         metadata={
-                            "source": "table",
+                            "source": (
+                                "table"
+                            ),
+
                             "table_index": (
                                 current_table_index
                             ),
+
                             "row_index": (
                                 row_index
                             ),
+
                             "column_count": (
                                 len(values)
                             ),
+
                             "non_empty_cell_count": (
                                 sum(
                                     1
@@ -349,6 +520,10 @@ class DOCXLoader(BaseLoader):
                                     in values
                                     if value
                                 )
+                            ),
+
+                            "physical_page_number_available": (
+                                False
                             ),
                         },
                     )
@@ -368,15 +543,9 @@ class DOCXLoader(BaseLoader):
         # Logical Page
         # ==============================================
         #
-        # DOCX 当前统一采用一个逻辑 Page。
+        # 这里的 Page 1 仅是统一模型中的“逻辑 Page”。
         #
-        # 后续：
-        #
-        #   ParagraphFilter
-        #   TableFilter
-        #   HeadingMerger
-        #
-        # 修改 blocks 后会重新同步 pages[0]。
+        # 不表示 Word 文档真实物理第 1 页。
 
         content = "\n".join(
             plain_text_lines
@@ -387,7 +556,9 @@ class DOCXLoader(BaseLoader):
         # ==============================================
 
         metadata = {
-            "source_format": "docx",
+            "source_format": (
+                "docx"
+            ),
 
             "loader": (
                 "DOCXLoader"
@@ -432,19 +603,556 @@ class DOCXLoader(BaseLoader):
             "character_count": (
                 len(content)
             ),
+
+            # Heading signal diagnostics
+            "style_heading_count": (
+                style_heading_count
+            ),
+
+            "paragraph_outline_heading_count": (
+                paragraph_outline_heading_count
+            ),
+
+            "style_outline_heading_count": (
+                style_outline_heading_count
+            ),
+
+            "numbering_assisted_heading_count": (
+                numbering_assisted_heading_count
+            ),
+
+            "heading_level_conflict_count": (
+                heading_level_conflict_count
+            ),
+
+            # DOCX physical pagination diagnostics
+            "page_number_strategy": (
+                "unavailable_for_docx_layout"
+            ),
+
+            "physical_page_number_available": (
+                False
+            ),
+
+            "logical_page_count": (
+                1
+            ),
         }
 
         return Document(
             file_name=path.name,
+
             file_type="docx",
+
             pages=[
                 Page(
                     page_number=1,
                     text=content,
                 )
             ],
+
             blocks=blocks,
+
             metadata=metadata,
+        )
+
+    # ==================================================
+    # Heading Level Resolution
+    # ==================================================
+
+    @classmethod
+    def _resolve_heading_level(
+        cls,
+        *,
+        style_heading_level: int | None,
+        paragraph_outline_level: int | None,
+        style_outline_level: int | None,
+        numbering_level: int | None,
+    ) -> tuple[
+        int | None,
+        str | None,
+        bool,
+    ]:
+        """
+        综合多个 Word OOXML 信号解析 Heading Level。
+
+        可信度顺序：
+            1. Paragraph outlineLvl
+            2. Style outlineLvl
+            3. Heading style
+            4. numbering ilvl 辅助修正
+
+        numbering ilvl 本身不会把普通 List 强行升级成 Heading。
+
+        但如果 Paragraph 已经由 Style / outlineLvl
+        确认为 Heading，而 numbering ilvl 与 Heading 层级冲突，
+        则 numbering 可用于恢复“所有标题错误设置为 Heading 1”
+        这类企业文档常见格式问题。
+        """
+
+        primary_candidates: list[
+            tuple[
+                str,
+                int | None,
+            ]
+        ] = [
+            (
+                "paragraph_outline",
+                paragraph_outline_level,
+            ),
+            (
+                "style_outline",
+                style_outline_level,
+            ),
+            (
+                "style",
+                style_heading_level,
+            ),
+        ]
+
+        existing = [
+            (
+                source,
+                cls._clamp_heading_level(
+                    level
+                ),
+            )
+            for source, level
+            in primary_candidates
+            if level is not None
+        ]
+
+        if not existing:
+            return (
+                None,
+                None,
+                False,
+            )
+
+        existing_levels = {
+            level
+            for _, level
+            in existing
+        }
+
+        conflict = (
+            len(existing_levels)
+            > 1
+        )
+
+        source, resolved_level = (
+            existing[0]
+        )
+
+        # ==============================================
+        # Numbering-assisted hierarchy recovery
+        # ==============================================
+
+        if numbering_level is not None:
+
+            numbering_heading_level = (
+                cls._clamp_heading_level(
+                    numbering_level + 1
+                )
+            )
+
+            if (
+                numbering_heading_level
+                != resolved_level
+            ):
+
+                resolved_level = (
+                    numbering_heading_level
+                )
+
+                source = (
+                    "numbering_assisted"
+                )
+
+                conflict = True
+
+        return (
+            resolved_level,
+            source,
+            conflict,
+        )
+
+    @classmethod
+    def _clamp_heading_level(
+        cls,
+        level: int,
+    ) -> int:
+
+        normalized = int(
+            level
+        )
+
+        return max(
+            cls._MIN_HEADING_LEVEL,
+            min(
+                normalized,
+                cls._MAX_HEADING_LEVEL,
+            ),
+        )
+
+    # ==================================================
+    # Heading Style
+    # ==================================================
+
+    @classmethod
+    def _get_style_heading_level(
+        cls,
+        *,
+        style_name: str | None,
+        style_id: str | None,
+    ) -> int | None:
+
+        for (
+            value,
+            pattern,
+        ) in (
+            (
+                style_name,
+                cls._HEADING_STYLE_NAME_PATTERN,
+            ),
+            (
+                style_id,
+                cls._HEADING_STYLE_ID_PATTERN,
+            ),
+        ):
+
+            if not value:
+                continue
+
+            normalized = (
+                cls._normalize_text(
+                    value
+                )
+            )
+
+            match = pattern.fullmatch(
+                normalized
+            )
+
+            if match is None:
+                continue
+
+            return cls._clamp_heading_level(
+                int(
+                    match.group(1)
+                )
+            )
+
+        return None
+
+    # ==================================================
+    # Paragraph Outline Level
+    # ==================================================
+
+    @classmethod
+    def _get_paragraph_outline_heading_level(
+        cls,
+        paragraph: Paragraph,
+    ) -> int | None:
+        """
+        读取 Paragraph 自身：
+
+            w:pPr/w:outlineLvl
+
+        OOXML outlineLvl:
+            0 -> Heading level 1
+            1 -> Heading level 2
+            ...
+        """
+
+        paragraph_element = (
+            paragraph._p
+        )
+
+        try:
+
+            outline_nodes = (
+                paragraph_element.xpath(
+                    "./w:pPr/w:outlineLvl"
+                )
+            )
+
+        except Exception:
+
+            return None
+
+        if not outline_nodes:
+            return None
+
+        value = outline_nodes[
+            0
+        ].get(
+            qn(
+                "w:val"
+            )
+        )
+
+        return cls._convert_zero_based_level(
+            value
+        )
+
+    # ==================================================
+    # Style Outline Level
+    # ==================================================
+
+    @classmethod
+    def _get_style_outline_heading_level(
+        cls,
+        paragraph: Paragraph,
+    ) -> int | None:
+        """
+        读取 Paragraph 所属 Style：
+
+            w:style/w:pPr/w:outlineLvl
+        """
+
+        style = (
+            paragraph.style
+        )
+
+        if style is None:
+            return None
+
+        style_element = getattr(
+            style,
+            "element",
+            None,
+        )
+
+        if style_element is None:
+            return None
+
+        try:
+
+            outline_nodes = (
+                style_element.xpath(
+                    "./w:pPr/w:outlineLvl"
+                )
+            )
+
+        except Exception:
+
+            return None
+
+        if not outline_nodes:
+            return None
+
+        value = outline_nodes[
+            0
+        ].get(
+            qn(
+                "w:val"
+            )
+        )
+
+        return cls._convert_zero_based_level(
+            value
+        )
+
+    # ==================================================
+    # Numbering
+    # ==================================================
+
+    @staticmethod
+    def _get_numbering_level(
+        paragraph: Paragraph,
+    ) -> int | None:
+        """
+        返回 Word numbering ilvl。
+
+        注意：
+            ilvl 是 0-based。
+        """
+
+        properties = (
+            paragraph._p.pPr
+        )
+
+        if (
+            properties is None
+            or properties.numPr is None
+        ):
+            return None
+
+        ilvl = (
+            properties.numPr.ilvl
+        )
+
+        if ilvl is None:
+            return None
+
+        try:
+
+            return int(
+                ilvl.val
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return None
+
+    @staticmethod
+    def _get_numbering_id(
+        paragraph: Paragraph,
+    ) -> int | None:
+
+        properties = (
+            paragraph._p.pPr
+        )
+
+        if (
+            properties is None
+            or properties.numPr is None
+        ):
+            return None
+
+        num_id = (
+            properties.numPr.numId
+        )
+
+        if num_id is None:
+            return None
+
+        try:
+
+            return int(
+                num_id.val
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return None
+
+    # ==================================================
+    # Style Metadata
+    # ==================================================
+
+    @staticmethod
+    def _get_style_name(
+        paragraph: Paragraph,
+    ) -> str | None:
+
+        style = (
+            paragraph.style
+        )
+
+        if style is None:
+            return None
+
+        name = getattr(
+            style,
+            "name",
+            None,
+        )
+
+        if not name:
+            return None
+
+        normalized = str(
+            name
+        ).strip()
+
+        return (
+            normalized
+            or None
+        )
+
+    @staticmethod
+    def _get_style_id(
+        paragraph: Paragraph,
+    ) -> str | None:
+
+        style = (
+            paragraph.style
+        )
+
+        if style is None:
+            return None
+
+        style_id = getattr(
+            style,
+            "style_id",
+            None,
+        )
+
+        if not style_id:
+            return None
+
+        normalized = str(
+            style_id
+        ).strip()
+
+        return (
+            normalized
+            or None
+        )
+
+    # ==================================================
+    # OOXML Level
+    # ==================================================
+
+    @classmethod
+    def _convert_zero_based_level(
+        cls,
+        value,
+    ) -> int | None:
+
+        if value is None:
+            return None
+
+        try:
+
+            zero_based_level = int(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return None
+
+        if zero_based_level < 0:
+            return None
+
+        return cls._clamp_heading_level(
+            zero_based_level + 1
+        )
+
+    # ==================================================
+    # List Detection
+    # ==================================================
+
+    @staticmethod
+    def _is_list_paragraph(
+        paragraph: Paragraph,
+    ) -> bool:
+        """
+        判断 Paragraph 是否包含 Word 编号或项目符号属性。
+        """
+
+        properties = (
+            paragraph._p.pPr
+        )
+
+        if properties is None:
+            return False
+
+        return (
+            properties.numPr
+            is not None
         )
 
     # ==================================================
@@ -469,7 +1177,8 @@ class DOCXLoader(BaseLoader):
         if not path.exists():
 
             raise FileNotFoundError(
-                f"DOCX file not found: {path}"
+                "DOCX file not found: "
+                f"{path}"
             )
 
         if not path.is_file():
@@ -513,14 +1222,9 @@ class DOCXLoader(BaseLoader):
         text: str | None,
     ) -> str:
         """
-        Loader 级别的轻量文本标准化。
+        Loader 级别轻量文本标准化。
 
-        这里只处理明显的空白差异。
-
-        更全面的 Unicode 清洗由：
-            UnicodeNormalizer
-
-        负责。
+        不执行具有业务语义的改写。
         """
 
         if text is None:
@@ -558,22 +1262,6 @@ class DOCXLoader(BaseLoader):
             )
         )
 
-        # ==============================================
-        # Preserve Meaningful Multiline Content
-        # ==============================================
-        #
-        # Word Cell 内可能包含多个 Paragraph：
-        #
-        #   AAA
-        #   BBB
-        #
-        # 统一成：
-        #
-        #   AAA / BBB
-        #
-        # 避免直接压缩成 "AAA BBB"，
-        # 保留一定的内部结构信息。
-
         lines = [
             " ".join(
                 line.split()
@@ -583,99 +1271,11 @@ class DOCXLoader(BaseLoader):
             if line.strip()
         ]
 
+        # 对同一个 Paragraph / Cell 内的多行，
+        # 保留显式分隔，避免直接粘连。
         return " / ".join(
             lines
         ).strip()
-
-    # ==================================================
-    # Style Name
-    # ==================================================
-
-    @staticmethod
-    def _get_style_name(
-        paragraph: Paragraph,
-    ) -> str | None:
-
-        style = (
-            paragraph.style
-        )
-
-        if style is None:
-            return None
-
-        name = getattr(
-            style,
-            "name",
-            None,
-        )
-
-        if not name:
-            return None
-
-        normalized = str(
-            name
-        ).strip()
-
-        return (
-            normalized
-            or None
-        )
-
-    # ==================================================
-    # Heading Level
-    # ==================================================
-
-    @classmethod
-    def _get_heading_level(
-        cls,
-        style_name: str | None,
-    ) -> int | None:
-
-        if not style_name:
-            return None
-
-        normalized = (
-            cls._normalize_text(
-                style_name
-            )
-        )
-
-        match = (
-            cls._HEADING_STYLE_PATTERN.fullmatch(
-                normalized
-            )
-        )
-
-        if match is None:
-            return None
-
-        return int(
-            match.group(1)
-        )
-
-    # ==================================================
-    # List Detection
-    # ==================================================
-
-    @staticmethod
-    def _is_list_paragraph(
-        paragraph: Paragraph,
-    ) -> bool:
-        """
-        判断 Paragraph 是否包含 Word 编号或项目符号属性。
-        """
-
-        properties = (
-            paragraph._p.pPr
-        )
-
-        if properties is None:
-            return False
-
-        return (
-            properties.numPr
-            is not None
-        )
 
     # ==================================================
     # Extract Table Row
@@ -689,27 +1289,10 @@ class DOCXLoader(BaseLoader):
         """
         提取一行所有 Cell。
 
-        重要：
-            保留空 Cell。
-            保留相同文本 Cell。
-
-        Example:
-
-            Word:
-                A |   | C
-
-            Result:
-                ["A", "", "C"]
-
-        Example:
-
-            Word:
-                ON | ON | OFF
-
-            Result:
-                ["ON", "ON", "OFF"]
-
-        Loader 不进行 Cell 去重。
+        保留：
+            - 空 Cell
+            - 重复 Cell
+            - 原始列位置
         """
 
         values: list[
@@ -741,15 +1324,7 @@ class DOCXLoader(BaseLoader):
         """
         构建用于 Page / Block 的逻辑表格文本。
 
-        Cell 数组本身仍保留完整列结构。
-
-        Example:
-
-            ["A", "", "C"]
-
-        Text:
-
-            A |  | C
+        cells 本身仍完整保存列位置。
         """
 
         return " | ".join(
@@ -767,17 +1342,17 @@ class DOCXLoader(BaseLoader):
         Paragraph | Table
     ]:
         """
-        按 document.xml 中原始顺序遍历：
+        按 document.xml 原始顺序遍历：
 
             Paragraph
             Table
 
-        从而避免：
+        避免分别读取：
 
             document.paragraphs
             document.tables
 
-        分开读取后破坏原始顺序。
+        导致 Paragraph / Table 相对顺序丢失。
         """
 
         parent_element = (

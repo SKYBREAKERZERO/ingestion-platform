@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import zipfile
+from xml.etree.ElementTree import iterparse
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +11,7 @@ from typing import Any, Iterable
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.loader.base_loader import BaseLoader
@@ -27,6 +30,7 @@ class XLSXLoader(BaseLoader):
 
     负责：
         - 加载 XLSX 工作簿
+        - 识别实际有值单元格范围，规避 Excel UsedRange / 格式污染
         - 按工作表和行顺序读取单元格
         - 每个非空行生成一个 TABLE Block
         - 保留 Sheet、行、列和单元格位置
@@ -64,6 +68,9 @@ class XLSXLoader(BaseLoader):
         row_separator: str = " | ",
         maximum_rows_per_sheet: int | None = None,
         maximum_columns_per_sheet: int | None = None,
+        trim_inflated_used_range: bool = True,
+        used_range_inflation_ratio: float = 4.0,
+        used_range_inflation_min_extra_rows: int = 1000,
         print_summary: bool = False,
     ) -> None:
 
@@ -86,6 +93,16 @@ class XLSXLoader(BaseLoader):
         ):
             raise ValueError(
                 "maximum_columns_per_sheet must be greater than 0."
+            )
+
+        if used_range_inflation_ratio < 1.0:
+            raise ValueError(
+                "used_range_inflation_ratio must be at least 1.0."
+            )
+
+        if used_range_inflation_min_extra_rows < 0:
+            raise ValueError(
+                "used_range_inflation_min_extra_rows cannot be negative."
             )
 
         if preserve_formulas_in_metadata and read_only:
@@ -130,6 +147,18 @@ class XLSXLoader(BaseLoader):
             maximum_columns_per_sheet
         )
 
+        self.trim_inflated_used_range = bool(
+            trim_inflated_used_range
+        )
+
+        self.used_range_inflation_ratio = float(
+            used_range_inflation_ratio
+        )
+
+        self.used_range_inflation_min_extra_rows = int(
+            used_range_inflation_min_extra_rows
+        )
+
         self.print_summary = bool(
             print_summary
         )
@@ -170,6 +199,10 @@ class XLSXLoader(BaseLoader):
             total_non_empty_row_count = 0
             total_cell_count = 0
             total_non_empty_cell_count = 0
+
+            used_range_trimmed_sheet_count = 0
+            used_range_total_raw_max_row = 0
+            used_range_total_effective_max_row = 0
 
             sheet_metadata: list[
                 dict[str, Any]
@@ -217,8 +250,57 @@ class XLSXLoader(BaseLoader):
                 first_data_column: int | None = None
                 last_data_column: int | None = None
 
+                raw_max_row = int(
+                    getattr(
+                        worksheet,
+                        "max_row",
+                        0,
+                    )
+                    or 0
+                )
+
+                raw_max_column = int(
+                    getattr(
+                        worksheet,
+                        "max_column",
+                        0,
+                    )
+                    or 0
+                )
+
+                (
+                    effective_max_row,
+                    effective_max_column,
+                    used_range_diagnostics,
+                ) = self._resolve_effective_used_range(
+                    workbook_path=path,
+                    worksheet=worksheet,
+                    raw_max_row=raw_max_row,
+                    raw_max_column=raw_max_column,
+                )
+
+                used_range_total_raw_max_row += (
+                    raw_max_row
+                )
+
+                used_range_total_effective_max_row += (
+                    effective_max_row
+                )
+
+                if used_range_diagnostics[
+                    "trimmed"
+                ]:
+
+                    used_range_trimmed_sheet_count += 1
+
                 row_iterator = self._iter_rows(
-                    worksheet
+                    worksheet,
+                    max_row=(
+                        effective_max_row
+                    ),
+                    max_column=(
+                        effective_max_column
+                    ),
                 )
 
                 for row_number, row in enumerate(
@@ -382,6 +464,58 @@ class XLSXLoader(BaseLoader):
                             logical_page_number
                         ),
                         "row_count": sheet_row_count,
+                        "raw_max_row": (
+                            raw_max_row
+                        ),
+                        "raw_max_column": (
+                            raw_max_column
+                        ),
+                        "effective_max_row": (
+                            effective_max_row
+                        ),
+                        "effective_max_column": (
+                            effective_max_column
+                        ),
+                        "used_range_strategy": (
+                            used_range_diagnostics[
+                                "strategy"
+                            ]
+                        ),
+                        "used_range_trimmed": (
+                            used_range_diagnostics[
+                                "trimmed"
+                            ]
+                        ),
+                        "used_range_trimmed_row_count": (
+                            used_range_diagnostics[
+                                "trimmed_row_count"
+                            ]
+                        ),
+                        "used_range_trimmed_column_count": (
+                            used_range_diagnostics[
+                                "trimmed_column_count"
+                            ]
+                        ),
+                        "used_range_content_first_row": (
+                            used_range_diagnostics[
+                                "content_first_row"
+                            ]
+                        ),
+                        "used_range_content_last_row": (
+                            used_range_diagnostics[
+                                "content_last_row"
+                            ]
+                        ),
+                        "used_range_content_first_column": (
+                            used_range_diagnostics[
+                                "content_first_column"
+                            ]
+                        ),
+                        "used_range_content_last_column": (
+                            used_range_diagnostics[
+                                "content_last_column"
+                            ]
+                        ),
                         "non_empty_row_count": (
                             sheet_non_empty_row_count
                         ),
@@ -428,6 +562,23 @@ class XLSXLoader(BaseLoader):
                 ),
                 "preserve_formulas_in_metadata": (
                     self.preserve_formulas_in_metadata
+                ),
+                "trim_inflated_used_range": (
+                    self.trim_inflated_used_range
+                ),
+                "used_range_strategy": (
+                    "worksheet_xml_nonempty_cell_bounds_v1"
+                    if self.trim_inflated_used_range
+                    else "worksheet_declared_dimension"
+                ),
+                "used_range_trimmed_sheet_count": (
+                    used_range_trimmed_sheet_count
+                ),
+                "used_range_total_raw_max_row": (
+                    used_range_total_raw_max_row
+                ),
+                "used_range_total_effective_max_row": (
+                    used_range_total_effective_max_row
                 ),
                 "sheet_count": total_sheet_count,
                 "processed_sheet_count": (
@@ -488,23 +639,526 @@ class XLSXLoader(BaseLoader):
     def _iter_rows(
         self,
         worksheet: Worksheet,
+        *,
+        max_row: int,
+        max_column: int,
     ) -> Iterable[tuple[Any, ...]]:
         """
         顺序读取工作表行。
 
-        read_only=True 时依然支持 iter_rows()。
+        重要：
+            不直接依赖 worksheet.max_row / max_column。
+
+        某些 Excel 文件只因为整列/大量空行设置过格式，
+        worksheet.max_row 就可能膨胀到：
+
+            1,048,576
+
+        即使实际业务数据只到 202 行。
+
+        max_row / max_column 已由 _resolve_effective_used_range()
+        计算为“实际有值单元格范围”。
         """
 
-        max_column = (
-            self.maximum_columns_per_sheet
+        if (
+            max_row <= 0
+            or max_column <= 0
+        ):
+
+            return iter(
+                ()
+            )
+
+        requested_max_row = (
+            max_row
         )
 
-        if max_column is None:
-            return worksheet.iter_rows()
+        if (
+            self.maximum_rows_per_sheet
+            is not None
+        ):
+
+            requested_max_row = min(
+                requested_max_row,
+                self.maximum_rows_per_sheet,
+            )
+
+        requested_max_column = (
+            max_column
+        )
+
+        if (
+            self.maximum_columns_per_sheet
+            is not None
+        ):
+
+            requested_max_column = min(
+                requested_max_column,
+                self.maximum_columns_per_sheet,
+            )
 
         return worksheet.iter_rows(
-            max_col=max_column
+            min_row=1,
+            max_row=(
+                requested_max_row
+            ),
+            min_col=1,
+            max_col=(
+                requested_max_column
+            ),
         )
+
+    # ==================================================
+    # Used Range / Inflated Dimension Guard
+    # ==================================================
+
+    def _resolve_effective_used_range(
+        self,
+        *,
+        workbook_path: Path,
+        worksheet: Worksheet,
+        raw_max_row: int,
+        raw_max_column: int,
+    ) -> tuple[
+        int,
+        int,
+        dict[str, Any],
+    ]:
+        """
+        返回实际需要读取的最大行/列。
+
+        Excel 经常出现：
+
+            raw_max_row = 1,048,551
+            real_last_row = 202
+
+        原因通常是格式/样式曾被应用到大量空白行。
+
+        这里直接扫描对应 worksheet XML 中真正带值的 Cell：
+
+            <c ...><v>...</v></c>
+            <c ...><f>...</f></c>
+            <c t="inlineStr">...</c>
+
+        仅有样式、没有值的：
+
+            <c r="T1048551" s="12"/>
+
+        不计入有效 UsedRange。
+
+        如果 XML 扫描失败，则安全回退到 worksheet 声明范围。
+        """
+
+        raw_row = max(
+            int(
+                raw_max_row
+                or 0
+            ),
+            0,
+        )
+
+        raw_column = max(
+            int(
+                raw_max_column
+                or 0
+            ),
+            0,
+        )
+
+        diagnostics: dict[
+            str,
+            Any,
+        ] = {
+            "strategy": (
+                "worksheet_declared_dimension"
+            ),
+            "trimmed": (
+                False
+            ),
+            "trimmed_row_count": (
+                0
+            ),
+            "trimmed_column_count": (
+                0
+            ),
+            "content_first_row": (
+                None
+            ),
+            "content_last_row": (
+                None
+            ),
+            "content_first_column": (
+                None
+            ),
+            "content_last_column": (
+                None
+            ),
+        }
+
+        if not self.trim_inflated_used_range:
+
+            return (
+                raw_row,
+                raw_column,
+                diagnostics,
+            )
+
+        try:
+
+            (
+                first_row,
+                last_row,
+                first_column,
+                last_column,
+            ) = self._scan_worksheet_xml_content_bounds(
+                workbook_path=(
+                    workbook_path
+                ),
+                worksheet=(
+                    worksheet
+                ),
+            )
+
+        except Exception:
+
+            diagnostics[
+                "strategy"
+            ] = (
+                "worksheet_declared_dimension_fallback"
+            )
+
+            return (
+                raw_row,
+                raw_column,
+                diagnostics,
+            )
+
+        diagnostics.update(
+            {
+                "strategy": (
+                    "worksheet_xml_nonempty_cell_bounds_v1"
+                ),
+                "content_first_row": (
+                    first_row
+                ),
+                "content_last_row": (
+                    last_row
+                ),
+                "content_first_column": (
+                    first_column
+                ),
+                "content_last_column": (
+                    last_column
+                ),
+            }
+        )
+
+        # Truly empty worksheet.
+        if (
+            last_row is None
+            or last_column is None
+        ):
+
+            effective_row = 0
+            effective_column = 0
+
+        else:
+
+            effective_row = int(
+                last_row
+            )
+
+            effective_column = int(
+                last_column
+            )
+
+        if (
+            self.maximum_rows_per_sheet
+            is not None
+        ):
+
+            effective_row = min(
+                effective_row,
+                self.maximum_rows_per_sheet,
+            )
+
+        if (
+            self.maximum_columns_per_sheet
+            is not None
+        ):
+
+            effective_column = min(
+                effective_column,
+                self.maximum_columns_per_sheet,
+            )
+
+        row_extra = max(
+            raw_row
+            - effective_row,
+            0,
+        )
+
+        column_extra = max(
+            raw_column
+            - effective_column,
+            0,
+        )
+
+        row_ratio = (
+            (
+                raw_row
+                / max(
+                    effective_row,
+                    1,
+                )
+            )
+            if raw_row
+            else 1.0
+        )
+
+        # Only label it as "inflated" when the gap is materially large.
+        #
+        # We still use XML-derived effective bounds for normal workbooks;
+        # the flag is specifically diagnostic.
+        trimmed = (
+            row_extra
+            >= self.used_range_inflation_min_extra_rows
+            and row_ratio
+            >= self.used_range_inflation_ratio
+        )
+
+        diagnostics[
+            "trimmed"
+        ] = (
+            trimmed
+        )
+
+        diagnostics[
+            "trimmed_row_count"
+        ] = (
+            row_extra
+            if trimmed
+            else 0
+        )
+
+        diagnostics[
+            "trimmed_column_count"
+        ] = (
+            column_extra
+            if trimmed
+            else 0
+        )
+
+        return (
+            effective_row,
+            effective_column,
+            diagnostics,
+        )
+
+    @classmethod
+    def _scan_worksheet_xml_content_bounds(
+        cls,
+        *,
+        workbook_path: Path,
+        worksheet: Worksheet,
+    ) -> tuple[
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+    ]:
+        """
+        流式扫描 worksheet XML，找真正含值/公式的 Cell 范围。
+
+        不加载整个 XML 到内存。
+        """
+
+        worksheet_path = str(
+            getattr(
+                worksheet,
+                "_worksheet_path",
+                "",
+            )
+            or ""
+        ).lstrip(
+            "/"
+        )
+
+        if not worksheet_path:
+
+            raise XLSXLoaderError(
+                "Worksheet XML path is unavailable."
+            )
+
+        first_row: int | None = None
+        last_row: int | None = None
+        first_column: int | None = None
+        last_column: int | None = None
+
+        with zipfile.ZipFile(
+            workbook_path,
+            mode="r",
+        ) as archive:
+
+            with archive.open(
+                worksheet_path,
+                mode="r",
+            ) as stream:
+
+                for (
+                    event,
+                    element,
+                ) in iterparse(
+                    stream,
+                    events=(
+                        "end",
+                    ),
+                ):
+
+                    if not element.tag.endswith(
+                        "}c"
+                    ):
+
+                        continue
+
+                    if not cls._xml_cell_has_content(
+                        element
+                    ):
+
+                        element.clear()
+
+                        continue
+
+                    coordinate = str(
+                        element.attrib.get(
+                            "r",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    if not coordinate:
+
+                        element.clear()
+
+                        continue
+
+                    try:
+
+                        (
+                            row_number,
+                            column_number,
+                        ) = coordinate_to_tuple(
+                            coordinate
+                        )
+
+                    except Exception:
+
+                        element.clear()
+
+                        continue
+
+                    first_row = (
+                        row_number
+                        if first_row is None
+                        else min(
+                            first_row,
+                            row_number,
+                        )
+                    )
+
+                    last_row = (
+                        row_number
+                        if last_row is None
+                        else max(
+                            last_row,
+                            row_number,
+                        )
+                    )
+
+                    first_column = (
+                        column_number
+                        if first_column is None
+                        else min(
+                            first_column,
+                            column_number,
+                        )
+                    )
+
+                    last_column = (
+                        column_number
+                        if last_column is None
+                        else max(
+                            last_column,
+                            column_number,
+                        )
+                    )
+
+                    element.clear()
+
+        return (
+            first_row,
+            last_row,
+            first_column,
+            last_column,
+        )
+
+    @staticmethod
+    def _xml_cell_has_content(
+        cell_element: Any,
+    ) -> bool:
+        """
+        判断 worksheet XML 的 <c> 是否包含真实内容。
+
+        有效：
+            <v>
+            <f>
+            inlineStr / <is><t>...</t></is>
+
+        无效：
+            只有 style / format 的空 Cell。
+        """
+
+        for child in list(
+            cell_element
+        ):
+
+            tag = str(
+                child.tag
+            )
+
+            if tag.endswith(
+                "}f"
+            ):
+
+                return True
+
+            if tag.endswith(
+                "}v"
+            ):
+
+                return True
+
+            if tag.endswith(
+                "}is"
+            ):
+
+                for descendant in child.iter():
+
+                    if str(
+                        descendant.tag
+                    ).endswith(
+                        "}t"
+                    ):
+
+                        if str(
+                            descendant.text
+                            or ""
+                        ):
+
+                            return True
+
+        return False
 
     def _extract_row(
         self,
