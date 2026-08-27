@@ -277,7 +277,7 @@ def get_base_directory() -> Path:
 BASE_DIR = get_base_directory()
 
 LOG_DIR = (
-    BASE_DIR
+    USER_CONFIG_DIR
     / "logs"
 )
 
