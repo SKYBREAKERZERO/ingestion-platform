@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 from app.database.connection import DatabaseConnection
@@ -12,78 +14,55 @@ class PostgresStorageError(RuntimeError):
 
 class PostgresStorage:
     """
-    Document PostgreSQL 存储实现。
+    RAG-ready PostgreSQL persistence for Document Ingestion Platform.
 
-    保存顺序：
+    Public contract is intentionally unchanged:
 
-        documents
-        → chapters
-        → sections
-        → contents
+        PostgresStorage(...).save(document) -> bool
 
-    特性：
+    Design:
+        documents -> chapters -> sections -> contents
 
-        - 单事务保存
-        - Document / Chapter / Section 使用 UPSERT
-        - 每次重新导入时替换旧 Contents
-        - 自动删除当前文档中已经不存在的 Chapter / Section
-        - 防止 chapter_id=None 的孤立 Section 入库
-        - 为 Chapter 直属 Content 创建数据库内部 ROOT Section
-        - 删除旧 Contents 后再清理 stale structure，避免外键顺序问题
-        - 内容变更后 embedding_status 重置为 PENDING
+    RAG-specific behavior:
+        - contents.id remains stable when the same logical chunk is re-imported
+        - logical chunk identity is (document_id, section_id, chunk_index)
+        - content_hash is SHA-256 of the exact chunk text
+        - changed chunk/payload metadata resets embedding_status to PENDING
+        - unchanged chunks keep the existing embedding state
+        - removed chunks are queued in vector_delete_queue before deletion
+        - chapter-direct Content still uses <chapter_id>.ROOT synthetic sections
+        - PostgreSQL remains the source of truth; Qdrant point ID should equal
+          contents.id
+
+    Transaction:
+        A whole document save is atomic.
     """
 
     def __init__(
         self,
         database_connection: DatabaseConnection | None = None,
     ) -> None:
+        self.db = database_connection or DatabaseConnection()
 
-        self.db = (
-            database_connection
-            or DatabaseConnection()
-        )
-
-    def save(
-        self,
-        document: Document,
-    ) -> bool:
-
-        self._validate_document(
-            document
-        )
-
-        document_id = self._resolve_document_id(
-            document
-        )
+    def save(self, document: Document) -> bool:
+        self._validate_document(document)
+        document_id = self._resolve_document_id(document)
 
         try:
             with self.db.connect() as conn:
                 try:
                     with conn.cursor() as cur:
-
-                        # ==========================
-                        # 1. Document
-                        # ==========================
-
                         self._save_document(
                             cur=cur,
                             document=document,
                             document_id=document_id,
                         )
 
-                        # ==========================
-                        # 2. Chapters
-                        # ==========================
-
                         chapter_ids = self._save_chapters(
                             cur=cur,
                             document=document,
                             document_id=document_id,
                         )
-
-                        # ==========================
-                        # 3. Sections
-                        # ==========================
 
                         section_ids = self._save_sections(
                             cur=cur,
@@ -92,60 +71,18 @@ class PostgresStorage:
                             chapter_ids=chapter_ids,
                         )
 
-                        # Chapter 下存在直属正文时，
-                        # 为数据库创建内部 ROOT Section。
-                        root_section_ids = (
-                            self._save_root_sections(
-                                cur=cur,
-                                document=document,
-                                document_id=document_id,
-                                chapter_ids=chapter_ids,
-                                existing_section_ids=section_ids,
-                            )
-                        )
-
-                        section_ids.update(
-                            root_section_ids
-                        )
-
-                        # ==========================
-                        # 4. Remove old Contents
-                        # ==========================
-                        #
-                        # 必须先删除当前文档旧 Contents，
-                        # 再删除 stale Section / Chapter。
-                        #
-                        # 如果数据库存在：
-                        #
-                        # contents -> sections -> chapters
-                        #
-                        # 外键，这个顺序不会依赖 CASCADE。
-
-                        self._delete_existing_contents(
+                        root_section_ids = self._save_root_sections(
                             cur=cur,
-                            document_id=document_id,
-                        )
-
-                        # ==========================
-                        # 5. Remove stale structure
-                        # ==========================
-
-                        self._delete_stale_sections(
-                            cur=cur,
-                            document_id=document_id,
-                            section_ids=section_ids,
-                        )
-
-                        self._delete_stale_chapters(
-                            cur=cur,
+                            document=document,
                             document_id=document_id,
                             chapter_ids=chapter_ids,
+                            existing_section_ids=section_ids,
                         )
+                        section_ids.update(root_section_ids)
 
-                        # ==========================
-                        # 6. Insert latest Contents
-                        # ==========================
-
+                        # Upsert current chunks first.  IDs remain stable for the
+                        # same logical chunk.  Stale chunks are queued/deleted
+                        # inside this method before stale sections are removed.
                         self._replace_contents(
                             cur=cur,
                             document=document,
@@ -153,6 +90,17 @@ class PostgresStorage:
                             chapter_ids=chapter_ids,
                             section_ids=section_ids,
                             delete_existing=False,
+                        )
+
+                        self._delete_stale_sections(
+                            cur=cur,
+                            document_id=document_id,
+                            section_ids=section_ids,
+                        )
+                        self._delete_stale_chapters(
+                            cur=cur,
+                            document_id=document_id,
+                            chapter_ids=chapter_ids,
                         )
 
                     conn.commit()
@@ -166,11 +114,9 @@ class PostgresStorage:
                 document=document,
                 document_id=document_id,
             )
-
             raise PostgresStorageError(
-                f"Failed to save document "
-                f"'{document.file_name}' to PostgreSQL: {exc}. "
-                f"{context}"
+                f"Failed to save document '{document.file_name}' "
+                f"to PostgreSQL: {exc}. {context}"
             ) from exc
 
         return True
@@ -182,37 +128,83 @@ class PostgresStorage:
     @staticmethod
     def _save_document(
         *,
-        cur,
+        cur: Any,
         document: Document,
         document_id: str,
     ) -> None:
+        metadata = dict(getattr(document, "metadata", None) or {})
+        file_name = str(document.file_name).strip()
+        file_type = str(document.file_type).strip()
+
+        language = metadata.get("language")
+        language_json = (
+            PostgresStorage._json_text(language)
+            if language is not None
+            else None
+        )
+        metadata_json = PostgresStorage._json_text(metadata)
+
+        source_hash = (
+            metadata.get("source_hash")
+            or metadata.get("file_hash")
+            or metadata.get("sha256")
+        )
 
         cur.execute(
             """
             INSERT INTO documents
             (
                 document_id,
+                file_name,
+                file_type,
                 title,
-                module
+                module,
+                document_type,
+                version,
+                company,
+                category,
+                source_file,
+                language,
+                source_hash,
+                metadata,
+                updated_at
             )
             VALUES
             (
-                %s,
-                %s,
-                %s
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, CAST(%s AS jsonb), %s,
+                CAST(%s AS jsonb), NOW()
             )
-            ON CONFLICT
-            (
-                document_id
-            )
+            ON CONFLICT (document_id)
             DO UPDATE SET
+                file_name = EXCLUDED.file_name,
+                file_type = EXCLUDED.file_type,
                 title = EXCLUDED.title,
-                module = EXCLUDED.module
+                module = EXCLUDED.module,
+                document_type = EXCLUDED.document_type,
+                version = EXCLUDED.version,
+                company = EXCLUDED.company,
+                category = EXCLUDED.category,
+                source_file = EXCLUDED.source_file,
+                language = EXCLUDED.language,
+                source_hash = EXCLUDED.source_hash,
+                metadata = EXCLUDED.metadata,
+                updated_at = NOW()
             """,
             (
                 document_id,
-                document.file_name,
-                document.file_type,
+                file_name,
+                file_type,
+                file_name,  # compatibility with the legacy schema/UI
+                file_type,  # compatibility with the legacy schema/UI
+                metadata.get("document_type") or file_type,
+                metadata.get("version"),
+                metadata.get("company"),
+                metadata.get("category"),
+                metadata.get("source_file") or file_name,
+                language_json,
+                str(source_hash) if source_hash is not None else None,
+                metadata_json,
             ),
         )
 
@@ -223,39 +215,25 @@ class PostgresStorage:
     @staticmethod
     def _save_chapters(
         *,
-        cur,
+        cur: Any,
         document: Document,
         document_id: str,
     ) -> set[str]:
-
         chapter_ids: set[str] = set()
 
-        for fallback_order, chapter in enumerate(
-            document.chapters,
-            start=1,
-        ):
-            chapter_id = str(
-                chapter.id
-            ).strip()
-
-            if not chapter_id:
+        for fallback_order, chapter in enumerate(document.chapters, start=1):
+            chapter_id = str(chapter.id).strip()
+            if not chapter_id or chapter_id in chapter_ids:
                 continue
+            chapter_ids.add(chapter_id)
 
-            if chapter_id in chapter_ids:
-                continue
-
-            chapter_ids.add(
-                chapter_id
-            )
-
-            sort_order = getattr(
-                chapter,
-                "sort_order",
-                None,
-            )
-
+            sort_order = getattr(chapter, "sort_order", None)
             if sort_order is None:
                 sort_order = fallback_order
+
+            metadata_json = PostgresStorage._json_text(
+                getattr(chapter, "metadata", None) or {}
+            )
 
             cur.execute(
                 """
@@ -265,40 +243,26 @@ class PostgresStorage:
                     chapter_id,
                     title_jp,
                     title_en,
-                    sort_order
+                    sort_order,
+                    metadata,
+                    updated_at
                 )
-                VALUES
-                (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s
-                )
-                ON CONFLICT
-                (
-                    document_id,
-                    chapter_id
-                )
+                VALUES (%s, %s, %s, %s, %s, CAST(%s AS jsonb), NOW())
+                ON CONFLICT (document_id, chapter_id)
                 DO UPDATE SET
                     title_jp = EXCLUDED.title_jp,
                     title_en = EXCLUDED.title_en,
-                    sort_order = EXCLUDED.sort_order
+                    sort_order = EXCLUDED.sort_order,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
                 """,
                 (
                     document_id,
                     chapter_id,
-                    getattr(
-                        chapter,
-                        "title_jp",
-                        None,
-                    ),
-                    getattr(
-                        chapter,
-                        "title_en",
-                        None,
-                    ),
-                    sort_order,
+                    getattr(chapter, "title_jp", None),
+                    getattr(chapter, "title_en", None),
+                    int(sort_order),
+                    metadata_json,
                 ),
             )
 
@@ -311,83 +275,35 @@ class PostgresStorage:
     @staticmethod
     def _save_sections(
         *,
-        cur,
+        cur: Any,
         document: Document,
         document_id: str,
         chapter_ids: set[str],
     ) -> set[str]:
-        """
-        保存普通 Section。
-
-        使用两阶段写入：
-
-            1. 先写所有 Section，parent_section_id=NULL
-            2. 再补 parent_section_id
-
-        这样即使数据库对 parent_section_id 存在自引用外键，
-        也不会依赖 document.sections 恰好是父节点优先顺序。
-        """
+        """Two-pass section upsert so parent links are order independent."""
 
         records: list[dict[str, Any]] = []
         section_ids: set[str] = set()
 
-        for fallback_order, section in enumerate(
-            document.sections,
-            start=1,
-        ):
-            section_id = str(
-                section.id
-            ).strip()
-
-            if not section_id:
+        for fallback_order, section in enumerate(document.sections, start=1):
+            section_id = str(section.id).strip()
+            if not section_id or section_id in section_ids:
                 continue
 
-            if section_id in section_ids:
-                continue
-
-            chapter_id = getattr(
-                section,
-                "chapter_id",
-                None,
-            )
-
+            chapter_id = getattr(section, "chapter_id", None)
             if not chapter_id:
-                chapter_id = section_id.split(
-                    ".",
-                    maxsplit=1,
-                )[0]
-
-            chapter_id = str(
-                chapter_id
-            ).strip()
-
-            # 防止孤立 Section 写入数据库。
+                chapter_id = section_id.split(".", maxsplit=1)[0]
+            chapter_id = str(chapter_id).strip()
             if chapter_id not in chapter_ids:
                 continue
 
-            parent_section_id = getattr(
-                section,
-                "parent_section_id",
-                None,
-            )
-
+            parent_section_id = getattr(section, "parent_section_id", None)
             if parent_section_id:
-                parent_section_id = str(
-                    parent_section_id
-                ).strip()
-
-            if (
-                not parent_section_id
-                or parent_section_id == section_id
-            ):
+                parent_section_id = str(parent_section_id).strip()
+            if not parent_section_id or parent_section_id == section_id:
                 parent_section_id = None
 
-            sort_order = getattr(
-                section,
-                "sort_order",
-                None,
-            )
-
+            sort_order = getattr(section, "sort_order", None)
             if sort_order is None:
                 sort_order = fallback_order
 
@@ -396,38 +312,25 @@ class PostgresStorage:
                     "section_id": section_id,
                     "chapter_id": chapter_id,
                     "parent_section_id": parent_section_id,
-                    "title_jp": getattr(
-                        section,
-                        "title_jp",
-                        None,
+                    "title_jp": getattr(section, "title_jp", None),
+                    "title_en": getattr(section, "title_en", None),
+                    "level": int(getattr(section, "level", 2) or 2),
+                    "sort_order": int(sort_order),
+                    "page_number": PostgresStorage._optional_int(
+                        getattr(section, "page_number", None)
                     ),
-                    "title_en": getattr(
-                        section,
-                        "title_en",
-                        None,
+                    "metadata": PostgresStorage._json_text(
+                        getattr(section, "metadata", None) or {}
                     ),
-                    "level": getattr(
-                        section,
-                        "level",
-                        2,
-                    ),
-                    "sort_order": sort_order,
                 }
             )
-
-            section_ids.add(
-                section_id
-            )
+            section_ids.add(section_id)
 
         chapter_by_section = {
-            record["section_id"]: record["chapter_id"]
-            for record in records
+            record["section_id"]: record["chapter_id"] for record in records
         }
 
-        # ==========================
-        # Pass 1: Upsert all sections
-        # ==========================
-
+        # Pass 1: all nodes, no parent link yet.
         for record in records:
             cur.execute(
                 """
@@ -440,31 +343,27 @@ class PostgresStorage:
                     title_jp,
                     title_en,
                     level,
-                    sort_order
+                    sort_order,
+                    page_number,
+                    metadata,
+                    updated_at
                 )
                 VALUES
                 (
-                    %s,
-                    %s,
-                    %s,
-                    NULL,
-                    %s,
-                    %s,
-                    %s,
-                    %s
+                    %s, %s, %s, NULL, %s, %s, %s, %s, %s,
+                    CAST(%s AS jsonb), NOW()
                 )
-                ON CONFLICT
-                (
-                    document_id,
-                    section_id
-                )
+                ON CONFLICT (document_id, section_id)
                 DO UPDATE SET
                     chapter_id = EXCLUDED.chapter_id,
                     parent_section_id = NULL,
                     title_jp = EXCLUDED.title_jp,
                     title_en = EXCLUDED.title_en,
                     level = EXCLUDED.level,
-                    sort_order = EXCLUDED.sort_order
+                    sort_order = EXCLUDED.sort_order,
+                    page_number = EXCLUDED.page_number,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
                 """,
                 (
                     document_id,
@@ -474,28 +373,19 @@ class PostgresStorage:
                     record["title_en"],
                     record["level"],
                     record["sort_order"],
+                    record["page_number"],
+                    record["metadata"],
                 ),
             )
 
-        # ==========================
-        # Pass 2: Restore parent links
-        # ==========================
-
+        # Pass 2: restore valid same-chapter parent links.
         for record in records:
-            parent_section_id = (
-                record["parent_section_id"]
-            )
-
+            parent_section_id = record["parent_section_id"]
             if not parent_section_id:
                 continue
-
-            # 父节点必须存在于本次有效 Section 集合中，
-            # 且必须属于相同 Chapter。
             if (
                 parent_section_id not in section_ids
-                or chapter_by_section.get(
-                    parent_section_id
-                )
+                or chapter_by_section.get(parent_section_id)
                 != record["chapter_id"]
             ):
                 continue
@@ -503,7 +393,8 @@ class PostgresStorage:
             cur.execute(
                 """
                 UPDATE sections
-                SET parent_section_id = %s
+                SET parent_section_id = %s,
+                    updated_at = NOW()
                 WHERE document_id = %s
                   AND section_id = %s
                 """,
@@ -519,76 +410,32 @@ class PostgresStorage:
     @staticmethod
     def _save_root_sections(
         *,
-        cur,
+        cur: Any,
         document: Document,
         document_id: str,
         chapter_ids: set[str],
         existing_section_ids: set[str],
     ) -> set[str]:
-        """
-        为 Chapter 直属 Content 创建数据库内部 ROOT Section。
-
-        Document 模型允许：
-
-            content.chapter_id != None
-            content.section_id == None
-
-        但当前 contents 表使用 section_id 存储归属关系。
-
-        因此数据库层使用：
-
-            <chapter_id>.ROOT
-
-        作为内部 Section。
-
-        ROOT Section 只属于数据库持久化表示，
-        不写回 document.sections。
-        """
-
         required_root_ids: dict[str, str] = {}
 
         for content in document.contents:
-            raw_section_id = getattr(
-                content,
-                "section_id",
-                None,
-            )
-
+            raw_section_id = getattr(content, "section_id", None)
             if raw_section_id:
                 continue
 
-            chapter_id = getattr(
-                content,
-                "chapter_id",
-                None,
-            )
-
+            chapter_id = getattr(content, "chapter_id", None)
             if not chapter_id:
                 continue
-
-            chapter_id = str(
-                chapter_id
-            ).strip()
-
+            chapter_id = str(chapter_id).strip()
             if chapter_id not in chapter_ids:
                 continue
 
-            root_section_id = (
-                f"{chapter_id}.ROOT"
-            )
-
-            # 如果 Document 本身已经有同 ID Section，
-            # 使用真实 Section，不创建 synthetic ROOT。
+            root_section_id = f"{chapter_id}.ROOT"
             if root_section_id in existing_section_ids:
                 continue
+            required_root_ids[root_section_id] = chapter_id
 
-            required_root_ids[
-                root_section_id
-            ] = chapter_id
-
-        for root_section_id, chapter_id in (
-            required_root_ids.items()
-        ):
+        for root_section_id, chapter_id in required_root_ids.items():
             cur.execute(
                 """
                 INSERT INTO sections
@@ -600,77 +447,69 @@ class PostgresStorage:
                     title_jp,
                     title_en,
                     level,
-                    sort_order
+                    sort_order,
+                    page_number,
+                    metadata,
+                    updated_at
                 )
                 VALUES
                 (
-                    %s,
-                    %s,
-                    %s,
-                    NULL,
-                    NULL,
-                    NULL,
-                    %s,
-                    %s
+                    %s, %s, %s, NULL, NULL, NULL, 1, 0, NULL,
+                    '{}'::jsonb, NOW()
                 )
-                ON CONFLICT
-                (
-                    document_id,
-                    section_id
-                )
+                ON CONFLICT (document_id, section_id)
                 DO UPDATE SET
                     chapter_id = EXCLUDED.chapter_id,
                     parent_section_id = NULL,
-                    title_jp = NULL,
-                    title_en = NULL,
-                    level = EXCLUDED.level,
-                    sort_order = EXCLUDED.sort_order
+                    level = 1,
+                    sort_order = 0,
+                    updated_at = NOW()
                 """,
-                (
-                    document_id,
-                    chapter_id,
-                    root_section_id,
-                    1,
-                    0,
-                ),
+                (document_id, chapter_id, root_section_id),
             )
 
-        return set(
-            required_root_ids
-        )
-
+        return set(required_root_ids)
 
     # ==================================================
-    # Contents
+    # Contents / stable Chunk IDs
     # ==================================================
 
     @staticmethod
     def _delete_existing_contents(
         *,
-        cur,
+        cur: Any,
         document_id: str,
     ) -> None:
         """
-        删除指定 Document 的旧 Contents。
+        Compatibility helper.
 
-        位于 stale structure cleanup 之前执行，
-        避免依赖数据库 ON DELETE CASCADE。
+        Full delete is intentionally no longer used by save(); deleting every
+        row would change contents.id on each import and break stable Qdrant
+        point IDs.  If called directly, rows are queued for Qdrant deletion.
         """
-
         cur.execute(
             """
-            DELETE FROM contents
+            SELECT id
+            FROM contents
             WHERE document_id = %s
+            ORDER BY id
             """,
-            (
-                document_id,
-            ),
+            (document_id,),
         )
+        ids = [int(row[0]) for row in cur.fetchall()]
+        PostgresStorage._queue_vector_deletions(
+            cur=cur,
+            document_id=document_id,
+            content_ids=ids,
+            reason="DOCUMENT_CONTENT_REPLACE",
+        )
+        if ids:
+            cur.execute("DELETE FROM contents WHERE id = ANY(%s)", (ids,))
 
     @staticmethod
     def _replace_contents(
         *,
-        cur,
+        cur: Any,
         document: Document,
         document_id: str,
         chapter_ids: set[str],
@@ -678,262 +517,312 @@ class PostgresStorage:
         delete_existing: bool = True,
     ) -> None:
         """
-        写入当前 Document 的最新 Chunk。
+        Upsert the latest logical chunks while preserving contents.id.
 
-        默认保持旧私有接口语义：
-
-            delete_existing=True
-
-        会先删除旧 Chunk 再写入。
-
-        save() 主流程为了满足外键删除顺序，
-        会提前删除旧 Contents，并传：
-
-            delete_existing=False
-
-        新写入内容统一设置：
-
-            embedding_status = PENDING
+        `delete_existing` is retained for private-interface compatibility but
+        no longer causes a destructive delete-before-insert.  Stale rows are
+        deleted only after the current logical chunk set has been upserted.
         """
+        del delete_existing
 
-        if delete_existing:
-            PostgresStorage._delete_existing_contents(
-                cur=cur,
-                document_id=document_id,
-            )
+        records = PostgresStorage._build_content_records(
+            document=document,
+            chapter_ids=chapter_ids,
+            section_ids=section_ids,
+        )
+        current_keys = {
+            (record["section_id"], record["chunk_index"])
+            for record in records
+        }
 
-        used_content_keys: set[
-            tuple[str, int]
-        ] = set()
+        cur.execute(
+            """
+            SELECT id, section_id, chunk_index
+            FROM contents
+            WHERE document_id = %s
+            ORDER BY id
+            """,
+            (document_id,),
+        )
+        existing_rows = [
+            (int(row[0]), str(row[1]), int(row[2])) for row in cur.fetchall()
+        ]
 
-        section_chunk_counters: dict[
-            str,
-            int
-        ] = {}
-
-        for content in document.contents:
-            text = str(
-                getattr(
-                    content,
-                    "text",
-                    "",
-                )
-                or ""
-            ).strip()
-
-            if not text:
-                continue
-
-            chapter_id = getattr(
-                content,
-                "chapter_id",
-                None,
-            )
-
-            if chapter_id:
-                chapter_id = str(
-                    chapter_id
-                ).strip()
-
-            raw_section_id = getattr(
-                content,
-                "section_id",
-                None,
-            )
-
-            if raw_section_id:
-                section_id = str(
-                    raw_section_id
-                ).strip()
-
-                # 引用了不存在的 Section 时，不入库
-                if section_id not in section_ids:
-                    continue
-
-            elif (
-                chapter_id
-                and chapter_id in chapter_ids
-            ):
-                # Chapter 标题下直接存在正文
-                section_id = (
-                    f"{chapter_id}.ROOT"
-                )
-
-            else:
-                # 防止 None.ROOT
-                continue
-
-            chunk_index = getattr(
-                content,
-                "chunk_index",
-                None,
-            )
-
-            if chunk_index is None:
-                chunk_index = (
-                    section_chunk_counters.get(
-                        section_id,
-                        0,
-                    )
-                )
-
-            chunk_index = int(
-                chunk_index
-            )
-
-            key = (
-                section_id,
-                chunk_index,
-            )
-
-            # 避免违反：
-            # UNIQUE(document_id, section_id, chunk_index)
-            if key in used_content_keys:
-                chunk_index = (
-                    section_chunk_counters.get(
-                        section_id,
-                        0,
-                    )
-                )
-
-                while (
-                    section_id,
-                    chunk_index,
-                ) in used_content_keys:
-                    chunk_index += 1
-
-                key = (
-                    section_id,
-                    chunk_index,
-                )
-
-            used_content_keys.add(
-                key
-            )
-
-            section_chunk_counters[
-                section_id
-            ] = chunk_index + 1
-
-            page_number = getattr(
-                content,
-                "page_number",
-                None,
-            )
-
-            token_count = getattr(
-                content,
-                "token_count",
-                0,
-            )
-
-            if token_count is None:
-                token_count = 0
-
+        for record in records:
             cur.execute(
                 """
                 INSERT INTO contents
                 (
                     document_id,
+                    chapter_id,
                     section_id,
                     content,
                     page_number,
                     chunk_index,
                     token_count,
-                    embedding_status
+                    sort_order,
+                    metadata,
+                    content_hash,
+                    embedding_status,
+                    embedding_retry_count,
+                    updated_at
                 )
                 VALUES
                 (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    CAST(%s AS jsonb), %s, 'PENDING', 0, NOW()
                 )
+                ON CONFLICT (document_id, section_id, chunk_index)
+                DO UPDATE SET
+                    chapter_id = EXCLUDED.chapter_id,
+                    content = EXCLUDED.content,
+                    page_number = EXCLUDED.page_number,
+                    token_count = EXCLUDED.token_count,
+                    sort_order = EXCLUDED.sort_order,
+                    metadata = EXCLUDED.metadata,
+                    content_hash = EXCLUDED.content_hash,
+                    embedding_status = CASE
+                        WHEN contents.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                          OR contents.chapter_id IS DISTINCT FROM EXCLUDED.chapter_id
+                          OR contents.page_number IS DISTINCT FROM EXCLUDED.page_number
+                          OR contents.token_count IS DISTINCT FROM EXCLUDED.token_count
+                          OR contents.sort_order IS DISTINCT FROM EXCLUDED.sort_order
+                        THEN 'PENDING'
+                        ELSE contents.embedding_status
+                    END,
+                    embedding_started_at = CASE
+                        WHEN contents.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                          OR contents.chapter_id IS DISTINCT FROM EXCLUDED.chapter_id
+                          OR contents.page_number IS DISTINCT FROM EXCLUDED.page_number
+                          OR contents.token_count IS DISTINCT FROM EXCLUDED.token_count
+                          OR contents.sort_order IS DISTINCT FROM EXCLUDED.sort_order
+                        THEN NULL
+                        ELSE contents.embedding_started_at
+                    END,
+                    embedded_at = CASE
+                        WHEN contents.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                          OR contents.chapter_id IS DISTINCT FROM EXCLUDED.chapter_id
+                          OR contents.page_number IS DISTINCT FROM EXCLUDED.page_number
+                          OR contents.token_count IS DISTINCT FROM EXCLUDED.token_count
+                          OR contents.sort_order IS DISTINCT FROM EXCLUDED.sort_order
+                        THEN NULL
+                        ELSE contents.embedded_at
+                    END,
+                    embedded_content_hash = CASE
+                        WHEN contents.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                        THEN NULL
+                        ELSE contents.embedded_content_hash
+                    END,
+                    embedding_error = CASE
+                        WHEN contents.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                          OR contents.chapter_id IS DISTINCT FROM EXCLUDED.chapter_id
+                          OR contents.page_number IS DISTINCT FROM EXCLUDED.page_number
+                          OR contents.token_count IS DISTINCT FROM EXCLUDED.token_count
+                          OR contents.sort_order IS DISTINCT FROM EXCLUDED.sort_order
+                        THEN NULL
+                        ELSE contents.embedding_error
+                    END,
+                    embedding_retry_count = CASE
+                        WHEN contents.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                          OR contents.chapter_id IS DISTINCT FROM EXCLUDED.chapter_id
+                          OR contents.page_number IS DISTINCT FROM EXCLUDED.page_number
+                          OR contents.token_count IS DISTINCT FROM EXCLUDED.token_count
+                          OR contents.sort_order IS DISTINCT FROM EXCLUDED.sort_order
+                        THEN 0
+                        ELSE contents.embedding_retry_count
+                    END,
+                    updated_at = NOW()
                 """,
                 (
                     document_id,
-                    section_id,
-                    text,
-                    page_number,
-                    chunk_index,
-                    int(token_count),
-                    "PENDING",
+                    record["chapter_id"],
+                    record["section_id"],
+                    record["content"],
+                    record["page_number"],
+                    record["chunk_index"],
+                    record["token_count"],
+                    record["sort_order"],
+                    record["metadata"],
+                    record["content_hash"],
                 ),
             )
 
+        stale_ids = [
+            row_id
+            for row_id, section_id, chunk_index in existing_rows
+            if (section_id, chunk_index) not in current_keys
+        ]
+
+        PostgresStorage._queue_vector_deletions(
+            cur=cur,
+            document_id=document_id,
+            content_ids=stale_ids,
+            reason="STALE_CONTENT",
+        )
+        if stale_ids:
+            cur.execute("DELETE FROM contents WHERE id = ANY(%s)", (stale_ids,))
+
+    @staticmethod
+    def _build_content_records(
+        *,
+        document: Document,
+        chapter_ids: set[str],
+        section_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        used_content_keys: set[tuple[str, int]] = set()
+        section_chunk_counters: dict[str, int] = {}
+        records: list[dict[str, Any]] = []
+
+        for fallback_order, content in enumerate(document.contents, start=1):
+            text = str(getattr(content, "text", "") or "").strip()
+            if not text:
+                continue
+
+            chapter_id = getattr(content, "chapter_id", None)
+            chapter_id = str(chapter_id).strip() if chapter_id else None
+
+            raw_section_id = getattr(content, "section_id", None)
+            if raw_section_id:
+                section_id = str(raw_section_id).strip()
+                if section_id not in section_ids:
+                    continue
+            elif chapter_id and chapter_id in chapter_ids:
+                section_id = f"{chapter_id}.ROOT"
+            else:
+                continue
+
+            if chapter_id not in chapter_ids:
+                # Derive from section identifier only as a conservative fallback.
+                candidate = section_id.split(".", maxsplit=1)[0]
+                chapter_id = candidate if candidate in chapter_ids else None
+            if chapter_id is None:
+                continue
+
+            chunk_index = getattr(content, "chunk_index", None)
+            if chunk_index is None:
+                chunk_index = section_chunk_counters.get(section_id, 0)
+            chunk_index = int(chunk_index)
+
+            key = (section_id, chunk_index)
+            if key in used_content_keys:
+                chunk_index = section_chunk_counters.get(section_id, 0)
+                while (section_id, chunk_index) in used_content_keys:
+                    chunk_index += 1
+                key = (section_id, chunk_index)
+
+            used_content_keys.add(key)
+            section_chunk_counters[section_id] = chunk_index + 1
+
+            token_count = getattr(content, "token_count", 0)
+            token_count = int(token_count or 0)
+
+            sort_order = getattr(content, "sort_order", None)
+            if sort_order is None:
+                sort_order = fallback_order
+
+            records.append(
+                {
+                    "chapter_id": chapter_id,
+                    "section_id": section_id,
+                    "content": text,
+                    "page_number": PostgresStorage._optional_int(
+                        getattr(content, "page_number", None)
+                    ),
+                    "chunk_index": chunk_index,
+                    "token_count": token_count,
+                    "sort_order": int(sort_order),
+                    "metadata": PostgresStorage._json_text(
+                        getattr(content, "metadata", None) or {}
+                    ),
+                    "content_hash": PostgresStorage._content_hash(text),
+                }
+            )
+
+        return records
+
+    @staticmethod
+    def _queue_vector_deletions(
+        *,
+        cur: Any,
+        document_id: str,
+        content_ids: list[int],
+        reason: str,
+    ) -> None:
+        if not content_ids:
+            return
+
+        # Keep compatibility with a database that has not yet been upgraded.
+        cur.execute("SELECT to_regclass('public.vector_delete_queue')")
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return
+
+        for content_id in content_ids:
+            cur.execute(
+                """
+                INSERT INTO vector_delete_queue
+                (
+                    content_id,
+                    document_id,
+                    reason,
+                    queued_at,
+                    processed_at,
+                    last_error
+                )
+                VALUES (%s, %s, %s, NOW(), NULL, NULL)
+                ON CONFLICT (content_id)
+                DO UPDATE SET
+                    document_id = EXCLUDED.document_id,
+                    reason = EXCLUDED.reason,
+                    queued_at = NOW(),
+                    processed_at = NULL,
+                    last_error = NULL
+                """,
+                (content_id, document_id, reason),
+            )
+
     # ==================================================
-    # Stale Data Cleanup
+    # Stale structure cleanup
     # ==================================================
 
     @staticmethod
     def _delete_stale_sections(
         *,
-        cur,
+        cur: Any,
         document_id: str,
         section_ids: set[str],
     ) -> None:
-
         if not section_ids:
-            cur.execute(
-                """
-                DELETE FROM sections
-                WHERE document_id = %s
-                """,
-                (
-                    document_id,
-                ),
-            )
+            cur.execute("DELETE FROM sections WHERE document_id = %s", (document_id,))
             return
 
         cur.execute(
             """
             DELETE FROM sections
             WHERE document_id = %s
-              AND NOT (
-                  section_id = ANY(%s)
-              )
+              AND NOT (section_id = ANY(%s))
             """,
-            (
-                document_id,
-                list(section_ids),
-            ),
+            (document_id, list(section_ids)),
         )
 
     @staticmethod
     def _delete_stale_chapters(
         *,
-        cur,
+        cur: Any,
         document_id: str,
         chapter_ids: set[str],
     ) -> None:
-
         if not chapter_ids:
-            cur.execute(
-                """
-                DELETE FROM chapters
-                WHERE document_id = %s
-                """,
-                (
-                    document_id,
-                ),
-            )
+            cur.execute("DELETE FROM chapters WHERE document_id = %s", (document_id,))
             return
 
         cur.execute(
             """
             DELETE FROM chapters
             WHERE document_id = %s
-              AND NOT (
-                  chapter_id = ANY(%s)
-              )
+              AND NOT (chapter_id = ANY(%s))
             """,
-            (
-                document_id,
-                list(chapter_ids),
-            ),
+            (document_id, list(chapter_ids)),
         )
 
     # ==================================================
@@ -941,17 +830,30 @@ class PostgresStorage:
     # ==================================================
 
     @staticmethod
+    def _content_hash(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _json_text(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    @staticmethod
     def _document_length_context(
         *,
         document: Document,
         document_id: str,
     ) -> str:
-        """
-        为数据库字段长度错误提供安全诊断信息。
-
-        只记录长度，不复制字段内容。
-        """
-
         return (
             "field_lengths="
             f"document_id:{len(document_id)}, "
@@ -960,59 +862,25 @@ class PostgresStorage:
         )
 
     @staticmethod
-    def _resolve_document_id(
-        document: Document,
-    ) -> str:
-
+    def _resolve_document_id(document: Document) -> str:
         metadata_document_id = (
-            document.metadata.get(
-                "document_id"
-            )
-            if document.metadata
-            else None
+            document.metadata.get("document_id") if document.metadata else None
         )
-
-        document_id = (
-            metadata_document_id
-            or document.file_name
-        )
-
-        document_id = str(
-            document_id
-        ).strip()
-
+        document_id = metadata_document_id or document.file_name
+        document_id = str(document_id).strip()
         if not document_id:
-            raise ValueError(
-                "document_id cannot be empty."
-            )
-
+            raise ValueError("document_id cannot be empty.")
         return document_id
 
     @staticmethod
-    def _validate_document(
-        document: Document,
-    ) -> None:
-
+    def _validate_document(document: Document) -> None:
         if document is None:
-            raise ValueError(
-                "Document cannot be None."
-            )
-
-        if not isinstance(
-            document,
-            Document,
-        ):
+            raise ValueError("Document cannot be None.")
+        if not isinstance(document, Document):
             raise TypeError(
-                "PostgresStorage expects an "
-                "app.model.document.Document instance."
+                "PostgresStorage expects an app.model.document.Document instance."
             )
-
         if not document.file_name.strip():
-            raise ValueError(
-                "Document file_name cannot be empty."
-            )
-
+            raise ValueError("Document file_name cannot be empty.")
         if not document.file_type.strip():
-            raise ValueError(
-                "Document file_type cannot be empty."
-            )
+            raise ValueError("Document file_type cannot be empty.")

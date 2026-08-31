@@ -173,6 +173,7 @@ from app.model.content import Content
 from app.model.document import Document
 from app.model.section import Section
 from app.storage.postgres_storage import PostgresStorage
+from app.storage.schema_manager import SchemaManager, RAG_SCHEMA_VERSION
 
 
 
@@ -181,7 +182,7 @@ from app.storage.postgres_storage import PostgresStorage
 # ============================================================
 
 APP_NAME = "Document Ingestion Platform"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 SUPPORTED_SUFFIXES = {
     ".pdf",
@@ -759,7 +760,7 @@ class DocumentIngestionGUI:
         self.postgres_schema_status_var = (
             tk.StringVar(
                 value=(
-                    "Required tables not verified"
+                    "RAG schema not verified"
                 )
             )
         )
@@ -2224,7 +2225,7 @@ class DocumentIngestionGUI:
         self.postgres_create_tables_button = (
             ttk.Button(
                 schema_row,
-                text="▦  Create / Verify Required Tables",
+                text="▦  Initialize / Upgrade RAG Database",
                 command=(
                     self.start_postgres_schema_initialization
                 ),
@@ -2242,7 +2243,7 @@ class DocumentIngestionGUI:
             schema_row,
             text=(
                 "Enabled only after a successful connection test. "
-                "Existing tables and data are not deleted."
+                "Non-destructive: existing business data is preserved."
             ),
             wraplength=560,
             justify=LEFT,
@@ -2432,7 +2433,7 @@ class DocumentIngestionGUI:
             "2. Enter Host, Port, Database and User.",
             "3. Enter the PostgreSQL password.",
             "4. Click Test Connection.",
-            "5. Click Create / Verify Required Tables.",
+            "5. Click Initialize / Upgrade RAG Database.",
             "6. Click Save Settings.",
             "7. Use Document Conversion or JSON → PostgreSQL.",
         )
@@ -3288,7 +3289,7 @@ class DocumentIngestionGUI:
         )
 
         self.postgres_schema_status_var.set(
-            "Required tables not verified"
+            "RAG schema not verified"
         )
 
         self.postgres_schema_status_label.configure(
@@ -3370,7 +3371,7 @@ class DocumentIngestionGUI:
             "postgres_schema_status_var",
         ):
             self.postgres_schema_status_var.set(
-                "Required tables not verified"
+                "RAG schema not verified"
             )
 
         if hasattr(
@@ -3384,114 +3385,86 @@ class DocumentIngestionGUI:
     def start_postgres_schema_initialization(
         self,
     ) -> None:
-        """
-        Create or verify the tables required by the current ingestion tool.
-
-        This operation is intentionally non-destructive:
-            - CREATE TABLE IF NOT EXISTS
-            - CREATE INDEX IF NOT EXISTS
-            - no DROP
-            - no TRUNCATE
-            - no DELETE
-        """
+        """Initialize or non-destructively upgrade the RAG database schema."""
 
         if self.is_processing:
             return
 
         if not self.postgres_connection_verified:
-
             messagebox.showwarning(
-                "PostgreSQL Schema",
+                "PostgreSQL RAG Schema",
                 (
                     "Test the PostgreSQL connection successfully "
-                    "before creating the required tables."
+                    "before initializing the RAG database."
                 ),
                 parent=self.root,
             )
-
             return
 
         if (
-            self.postgres_schema_thread
-            is not None
+            self.postgres_schema_thread is not None
             and self.postgres_schema_thread.is_alive()
         ):
             return
 
-        settings = (
-            self._collect_postgres_settings()
-        )
-
+        settings = self._collect_postgres_settings()
         if settings is None:
             return
 
         password = (
             self.postgres_password_var.get()
-            or os.getenv(
-                "POSTGRES_PASSWORD"
-            )
+            or os.getenv("POSTGRES_PASSWORD")
         )
-
         if not password:
-
             messagebox.showwarning(
-                "PostgreSQL Schema",
+                "PostgreSQL RAG Schema",
                 (
                     "The PostgreSQL password is not available. "
                     "Enter the password and test the connection again."
                 ),
                 parent=self.root,
             )
-
             self.postgres_password_entry.focus_set()
-
             return
 
         confirmed = messagebox.askyesno(
-            "Create Required Tables",
+            "Initialize / Upgrade RAG Database",
             (
-                "Create or verify the required PostgreSQL tables?\n\n"
-                "Tables:\n"
+                f"Initialize or upgrade PostgreSQL to RAG Schema v{RAG_SCHEMA_VERSION}?\n\n"
+                "Core tables:\n"
                 "  • documents\n"
                 "  • chapters\n"
                 "  • sections\n"
-                "  • contents\n\n"
-                "Existing tables and data will NOT be deleted."
+                "  • contents\n"
+                "  • embeddings\n\n"
+                "Support objects:\n"
+                "  • vector_delete_queue\n"
+                "  • schema_version\n"
+                "  • rag_chunks view\n"
+                "  • RAG / Worker indexes\n\n"
+                "This operation does NOT drop or truncate business tables.\n"
+                "Legacy duplicate indexes are reported, not automatically deleted."
             ),
             parent=self.root,
         )
-
         if not confirmed:
             return
 
-        self.postgres_create_tables_button.configure(
-            state=DISABLED
-        )
-
+        self.postgres_create_tables_button.configure(state=DISABLED)
         self.postgres_schema_status_var.set(
-            "Creating / verifying required tables..."
+            f"Initializing / upgrading RAG Schema v{RAG_SCHEMA_VERSION}..."
         )
+        self.postgres_schema_status_label.configure(bootstyle="warning")
 
-        self.postgres_schema_status_label.configure(
-            bootstyle="warning"
+        self.postgres_schema_thread = threading.Thread(
+            target=self._initialize_postgres_schema_worker,
+            kwargs={
+                "settings": settings,
+                "password": password,
+            },
+            daemon=True,
+            name="postgres-rag-schema-initializer",
         )
-
-        self.postgres_schema_thread = (
-            threading.Thread(
-                target=(
-                    self._initialize_postgres_schema_worker
-                ),
-                kwargs={
-                    "settings": settings,
-                    "password": password,
-                },
-                daemon=True,
-                name=(
-                    "postgres-schema-initializer"
-                ),
-            )
-        )
-
         self.postgres_schema_thread.start()
 
     def _initialize_postgres_schema_worker(
@@ -3500,335 +3473,59 @@ class DocumentIngestionGUI:
         settings: PostgreSQLSettings,
         password: str,
     ) -> None:
-
-        required_columns: dict[
-            str,
-            set[str],
-        ] = {
-            "documents": {
-                "id",
-                "document_id",
-                "title",
-                "module",
-                "document_type",
-                "version",
-                "company",
-                "category",
-                "source_file",
-                "language",
-                "created_at",
-                "updated_at",
-            },
-            "chapters": {
-                "id",
-                "document_id",
-                "chapter_id",
-                "title_jp",
-                "title_en",
-                "sort_order",
-                "created_at",
-                "updated_at",
-            },
-            "sections": {
-                "id",
-                "document_id",
-                "chapter_id",
-                "section_id",
-                "title_jp",
-                "title_en",
-                "level",
-                "sort_order",
-                "parent_section_id",
-                "created_at",
-                "updated_at",
-            },
-            "contents": {
-                "id",
-                "document_id",
-                "section_id",
-                "content",
-                "page_number",
-                "chunk_index",
-                "token_count",
-                "embedding_status",
-                "created_at",
-                "updated_at",
-            },
-        }
-
-        ddl_statements = (
-            """
-            CREATE TABLE IF NOT EXISTS documents
-            (
-                id SERIAL PRIMARY KEY,
-                document_id VARCHAR(255) NOT NULL,
-                title TEXT NOT NULL,
-                module VARCHAR(255),
-                document_type VARCHAR(50),
-                version VARCHAR(50),
-                company VARCHAR(200),
-                category VARCHAR(200),
-                source_file TEXT,
-                language JSONB,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT uq_documents_document_id
-                    UNIQUE (document_id)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS chapters
-            (
-                id SERIAL PRIMARY KEY,
-                document_id VARCHAR(255) NOT NULL,
-                chapter_id VARCHAR(50) NOT NULL,
-                title_jp TEXT,
-                title_en TEXT,
-                sort_order INTEGER,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT uq_chapters_document_chapter
-                    UNIQUE (document_id, chapter_id),
-                CONSTRAINT fk_chapters_document
-                    FOREIGN KEY (document_id)
-                    REFERENCES documents(document_id)
-                    ON DELETE CASCADE
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS sections
-            (
-                id SERIAL PRIMARY KEY,
-                document_id VARCHAR(255) NOT NULL,
-                chapter_id VARCHAR(50) NOT NULL,
-                section_id VARCHAR(50) NOT NULL,
-                title_jp TEXT,
-                title_en TEXT,
-                level INTEGER NOT NULL DEFAULT 2,
-                sort_order INTEGER,
-                parent_section_id VARCHAR(50),
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT uq_sections_document_section
-                    UNIQUE (document_id, section_id),
-                CONSTRAINT fk_sections_document
-                    FOREIGN KEY (document_id)
-                    REFERENCES documents(document_id)
-                    ON DELETE CASCADE
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS contents
-            (
-                id SERIAL PRIMARY KEY,
-                document_id VARCHAR(255) NOT NULL,
-                section_id VARCHAR(50) NOT NULL,
-                content TEXT NOT NULL,
-                page_number INTEGER,
-                chunk_index INTEGER NOT NULL DEFAULT 0,
-                token_count INTEGER,
-                embedding_status VARCHAR(20)
-                    NOT NULL DEFAULT 'PENDING',
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT uq_contents_document_section_chunk
-                    UNIQUE (
-                        document_id,
-                        section_id,
-                        chunk_index
-                    ),
-                CONSTRAINT fk_contents_document
-                    FOREIGN KEY (document_id)
-                    REFERENCES documents(document_id)
-                    ON DELETE CASCADE
-            )
-            """,
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS
-                ux_documents_document_id
-            ON documents(document_id)
-            """,
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS
-                ux_chapters_document_chapter
-            ON chapters(document_id, chapter_id)
-            """,
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS
-                ux_sections_document_section
-            ON sections(document_id, section_id)
-            """,
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS
-                ux_contents_document_section_chunk
-            ON contents(
-                document_id,
-                section_id,
-                chunk_index
-            )
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS
-                ix_chapters_document_id
-            ON chapters(document_id)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS
-                ix_sections_document_id
-            ON sections(document_id)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS
-                ix_sections_document_chapter
-            ON sections(document_id, chapter_id)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS
-                ix_contents_document_id
-            ON contents(document_id)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS
-                ix_contents_embedding_status
-            ON contents(embedding_status)
-            """,
-        )
-
         try:
-            import psycopg
-
-            with psycopg.connect(
+            manager = SchemaManager(
                 host=settings.host,
                 port=settings.port,
-                dbname=settings.database,
+                database=settings.database,
                 user=settings.user,
                 password=password,
-                connect_timeout=(
-                    settings.connect_timeout
-                ),
-            ) as connection:
+                connect_timeout=settings.connect_timeout,
+            )
+            report = manager.ensure_schema()
 
-                with connection.cursor() as cursor:
-
-                    for statement in ddl_statements:
-
-                        cursor.execute(
-                            statement
-                        )
-
-                    cursor.execute(
-                        """
-                        SELECT
-                            table_name,
-                            column_name
-                        FROM information_schema.columns
-                        WHERE table_schema = 'public'
-                          AND table_name = ANY(%s)
-                        """,
-                        (
-                            list(
-                                required_columns.keys()
-                            ),
-                        ),
-                    )
-
-                    actual_columns: dict[
-                        str,
-                        set[str],
-                    ] = {
-                        table_name: set()
-                        for table_name
-                        in required_columns
-                    }
-
-                    for (
-                        table_name,
-                        column_name,
-                    ) in cursor.fetchall():
-
-                        if (
-                            table_name
-                            in actual_columns
-                        ):
-                            actual_columns[
-                                table_name
-                            ].add(
-                                column_name
-                            )
-
-                    missing: list[str] = []
-
-                    for (
-                        table_name,
-                        expected,
-                    ) in required_columns.items():
-
-                        missing_columns = sorted(
-                            expected
-                            - actual_columns[
-                                table_name
-                            ]
-                        )
-
-                        if missing_columns:
-
-                            missing.append(
-                                (
-                                    f"{table_name}: "
-                                    + ", ".join(
-                                        missing_columns
-                                    )
-                                )
-                            )
-
-                connection.commit()
-
-            if missing:
-
-                self._emit(
-                    "postgres_schema_result",
-                    {
-                        "success": False,
-                        "message": (
-                            "Schema verification failed"
-                        ),
-                        "detail": (
-                            "Missing required columns:\n"
-                            + "\n".join(
-                                missing
-                            )
-                        ),
-                    },
+            detail_lines = [report.status_text()]
+            if report.created_objects:
+                detail_lines.append(
+                    "Created / upgraded: "
+                    + ", ".join(report.created_objects)
                 )
-
-                return
+            if report.equivalent_indexes_reused:
+                detail_lines.append(
+                    "Equivalent indexes reused: "
+                    + str(len(report.equivalent_indexes_reused))
+                )
+            if report.duplicate_index_groups:
+                detail_lines.append(
+                    "Legacy duplicate indexes detected: "
+                    + str(len(report.duplicate_index_groups))
+                    + " group(s); left untouched for safe review."
+                )
+            if report.warnings:
+                detail_lines.extend(report.warnings)
 
             self._emit(
                 "postgres_schema_result",
                 {
-                    "success": True,
+                    "success": report.ready,
                     "message": (
-                        "Required tables are ready"
+                        f"RAG Schema v{RAG_SCHEMA_VERSION} is ready"
+                        if report.ready
+                        else "RAG schema verification failed"
                     ),
-                    "detail": (
-                        "documents / chapters / "
-                        "sections / contents"
-                    ),
+                    "detail": "\n".join(detail_lines),
+                    "duplicate_indexes": list(report.duplicate_index_groups),
                 },
             )
 
         except Exception as exc:
-
             self._emit(
                 "postgres_schema_result",
                 {
                     "success": False,
-                    "message": (
-                        "Schema initialization failed"
-                    ),
-                    "detail": str(
-                        exc
-                    ),
+                    "message": "RAG schema initialization failed",
+                    "detail": str(exc),
+                    "duplicate_indexes": [],
                 },
             )
 
@@ -3836,96 +3533,51 @@ class DocumentIngestionGUI:
         self,
         payload: Any,
     ) -> None:
-
-        if not isinstance(
-            payload,
-            dict,
-        ):
+        if not isinstance(payload, dict):
             return
 
-        success = bool(
-            payload.get(
-                "success"
-            )
-        )
+        success = bool(payload.get("success"))
+        message = str(payload.get("message", ""))
+        detail = str(payload.get("detail", ""))
 
-        message = str(
-            payload.get(
-                "message",
-                "",
-            )
-        )
-
-        detail = str(
-            payload.get(
-                "detail",
-                "",
-            )
+        self.postgres_schema_status_var.set(
+            f"{message}\n{detail}" if detail else message
         )
 
         if success:
-
-            self.postgres_schema_status_var.set(
-                (
-                    f"{message}\n"
-                    f"{detail}"
-                )
-            )
-
-            self.postgres_schema_status_label.configure(
-                bootstyle="success"
-            )
-
+            self.postgres_schema_status_label.configure(bootstyle="success")
             LOGGER.info(
-                "PostgreSQL required tables are ready."
+                "PostgreSQL RAG schema is ready | version=%s",
+                RAG_SCHEMA_VERSION,
             )
-
             messagebox.showinfo(
-                "PostgreSQL Schema",
+                "PostgreSQL RAG Schema",
                 (
-                    "Required tables are ready.\n\n"
-                    "documents\n"
-                    "chapters\n"
-                    "sections\n"
-                    "contents"
+                    f"RAG Schema v{RAG_SCHEMA_VERSION} is ready.\n\n"
+                    "Core tables:\n"
+                    "documents / chapters / sections / contents / embeddings\n\n"
+                    "RAG view: rag_chunks\n"
+                    "Worker indexes: ready\n\n"
+                    "Any legacy duplicate indexes were left untouched."
                 ),
                 parent=self.root,
             )
-
         else:
-
-            self.postgres_schema_status_var.set(
-                (
-                    f"{message}\n"
-                    f"{detail}"
-                )
-            )
-
-            self.postgres_schema_status_label.configure(
-                bootstyle="danger"
-            )
-
+            self.postgres_schema_status_label.configure(bootstyle="danger")
             LOGGER.error(
-                "PostgreSQL schema initialization failed: %s",
+                "PostgreSQL RAG schema initialization failed: %s",
                 detail,
             )
-
             messagebox.showerror(
-                "PostgreSQL Schema",
-                (
-                    f"{message}.\n\n"
-                    f"{detail}"
-                ),
+                "PostgreSQL RAG Schema",
+                f"{message}.\n\n{detail}",
                 parent=self.root,
             )
 
         self.postgres_create_tables_button.configure(
             state=(
                 NORMAL
-                if (
-                    self.postgres_connection_verified
-                    and not self.is_processing
-                )
+                if self.postgres_connection_verified and not self.is_processing
                 else DISABLED
             )
         )
