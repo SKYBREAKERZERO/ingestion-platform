@@ -1,5 +1,36 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+"""
+Document Ingestion Platform - PyInstaller OneFile build spec
+
+Target:
+    Windows GUI / OneFile
+
+Entry:
+    app/gui/application.py
+
+Included desktop capabilities:
+    - PDF
+    - DOCX
+    - PPTX
+    - legacy PPT via Microsoft PowerPoint COM
+    - XLSX
+    - TXT
+    - PNG/JPG/JPEG OCR
+    - Structured JSON
+    - PostgreSQL / RAG Schema v3
+    - ttkbootstrap GUI
+
+Intentionally NOT bundled into this desktop EXE:
+    - torch
+    - transformers
+    - sentence_transformers
+    - qdrant_client
+
+Those modules belong to the separate embedding/vector runtime in the
+current architecture. Qdrant Server is never bundled by PyInstaller.
+"""
+
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
@@ -21,42 +52,39 @@ entry_script = (
     / "application.py"
 )
 
+if not entry_script.is_file():
+    raise FileNotFoundError(
+        f"Entry script not found: {entry_script}"
+    )
+
 
 # ============================================================
 # Collections
 # ============================================================
 
-hiddenimports: list[str] = []
+hiddenimports = []
 datas = []
 binaries = []
 
 
 # ============================================================
-# Helper Functions
+# Helpers
 # ============================================================
 
-def collect_package(
-    package_name: str,
-) -> None:
+def collect_package(package_name):
     """
-    Collect a package completely.
+    Collect package data, native binaries and hidden submodules.
 
-    Includes:
-        - data files
-        - binary files
-        - hidden imports
+    collect_all() is intentionally used for packages that commonly
+    load resources/native DLLs dynamically in a frozen application.
     """
 
     global datas
     global binaries
     global hiddenimports
 
-    (
-        package_datas,
-        package_binaries,
-        package_hiddenimports,
-    ) = collect_all(
-        package_name
+    package_datas, package_binaries, package_hiddenimports = (
+        collect_all(package_name)
     )
 
     datas += package_datas
@@ -64,74 +92,114 @@ def collect_package(
     hiddenimports += package_hiddenimports
 
 
-def safe_collect_package(
-    package_name: str,
-) -> None:
+def safe_collect_package(package_name):
     """
-    Collect an optional package without failing the entire build.
+    Collect an optional/runtime package without aborting the spec
+    immediately when it is not installed in the build environment.
     """
 
     try:
-        collect_package(
-            package_name
-        )
+        collect_package(package_name)
 
     except Exception as exc:
         print(
-            f"[PyInstaller] "
-            f"Skipping optional package "
-            f"{package_name}: {exc}"
+            "[PyInstaller] "
+            f"Skipping optional package '{package_name}': {exc}"
         )
 
 
-def safe_collect_submodules(
-    package_name: str,
-) -> None:
+def safe_collect_submodules(package_name):
     """
-    Safely collect hidden submodules.
+    Safely collect package submodules.
     """
 
     global hiddenimports
 
     try:
-        hiddenimports += collect_submodules(
-            package_name
-        )
+        hiddenimports += collect_submodules(package_name)
 
     except Exception as exc:
         print(
-            f"[PyInstaller] "
-            f"Unable to collect submodules "
-            f"for {package_name}: {exc}"
+            "[PyInstaller] "
+            f"Unable to collect submodules for '{package_name}': {exc}"
         )
 
 
-def deduplicate_sequence(
-    values,
+def collect_project_modules(
+    package_directory,
+    *,
+    excluded_prefixes=(),
+    excluded_modules=(),
 ):
     """
-    Preserve order while removing duplicates.
+    Convert every project *.py path into a hidden-import module name.
+
+    Why this exists:
+        app.pipeline.pipeline_factory uses importlib.import_module()
+        with module names stored as strings. Static PyInstaller analysis
+        therefore cannot reliably see every pipeline.
+
+        In addition, several project folders are namespace-package style
+        folders, so relying only on collect_submodules("app") is less
+        deterministic than enumerating the source tree directly.
+
+    Example:
+        app/pipeline/image_pipeline.py
+            -> app.pipeline.image_pipeline
+    """
+
+    result = []
+
+    package_directory = Path(package_directory).resolve()
+
+    for source_file in sorted(
+        package_directory.rglob("*.py")
+    ):
+        relative = source_file.relative_to(
+            project_root
+        ).with_suffix("")
+
+        parts = list(relative.parts)
+
+        if parts and parts[-1] == "__init__":
+            parts = parts[:-1]
+
+        if not parts:
+            continue
+
+        module_name = ".".join(parts)
+
+        if module_name in excluded_modules:
+            continue
+
+        if any(
+            module_name == prefix
+            or module_name.startswith(prefix + ".")
+            for prefix in excluded_prefixes
+        ):
+            continue
+
+        result.append(module_name)
+
+    return result
+
+
+def deduplicate_sequence(values):
+    """
+    Preserve order while removing duplicate PyInstaller entries.
     """
 
     result = []
     seen = set()
 
     for value in values:
-
-        key = repr(
-            value
-        )
+        key = repr(value)
 
         if key in seen:
             continue
 
-        seen.add(
-            key
-        )
-
-        result.append(
-            value
-        )
+        seen.add(key)
+        result.append(value)
 
     return result
 
@@ -140,168 +208,189 @@ def deduplicate_sequence(
 # Application Modules
 # ============================================================
 
-# The project uses routers / factories / pipelines and some
-# components may be loaded indirectly.
-safe_collect_submodules(
-    "app"
+app_directory = project_root / "app"
+
+if not app_directory.is_dir():
+    raise FileNotFoundError(
+        f"Application package directory not found: {app_directory}"
+    )
+
+# The current desktop GUI does not expose the local embedding worker or
+# Qdrant vector runtime. Do not force those heavy modules into the EXE.
+#
+# Everything else under app/ is enumerated explicitly. This fixes the
+# dynamic PipelineFactory failure such as:
+#
+#   No module named 'app.pipeline.image_pipeline'
+#
+hiddenimports += collect_project_modules(
+    app_directory,
+    excluded_prefixes=(
+        "app.embedding",
+        "app.vector",
+    ),
+    excluded_modules=(
+        # Backup source is not required by the executable.
+        "app.gui.application_backup",
+    ),
 )
 
 
-# Explicit pipeline entry points.
-hiddenimports += [
+# ============================================================
+# Dynamic Pipeline Entry Points
+# ============================================================
+#
+# PipelineFactory currently registers these modules by STRING and loads
+# them through importlib.import_module(). Keep this list explicit even
+# though collect_project_modules() above already discovers the files.
+#
+# This serves as both documentation and a build-time safety net.
+# ============================================================
+
+pipeline_modules = [
     "app.pipeline.pdf_pipeline",
     "app.pipeline.docx_pipeline",
-    "app.pipeline.pptx_pipeline",
     "app.pipeline.xlsx_pipeline",
+    "app.pipeline.pptx_pipeline",
+    "app.pipeline.ppt_pipeline",
+    "app.pipeline.txt_pipeline",
+    "app.pipeline.image_pipeline",
 ]
 
+hiddenimports += pipeline_modules
+
 
 # ============================================================
-# GUI
+# GUI / Tk
 # ============================================================
 
-# ttkbootstrap uses themes and package resources.
-safe_collect_submodules(
-    "ttkbootstrap"
-)
+# ttkbootstrap contains themes/resources that are needed at runtime.
+safe_collect_package("ttkbootstrap")
 
-safe_collect_package(
-    "ttkbootstrap"
-)
+# Pillow is used by ttkbootstrap and the image ingestion path.
+safe_collect_package("PIL")
 
 
-# Pillow is required by ttkbootstrap and image-related GUI
-# functionality.
-safe_collect_package(
-    "PIL"
-)
+# ============================================================
+# Data Models / Validation
+# ============================================================
+#
+# Pydantic v2 contains a native pydantic_core extension. PyInstaller
+# normally has hooks for it, but collecting it explicitly improves
+# reproducibility across build environments.
+# ============================================================
+
+safe_collect_package("pydantic")
+safe_collect_package("pydantic_core")
 
 
 # ============================================================
 # PDF
 # ============================================================
 
-# PyMuPDF
-safe_collect_package(
-    "fitz"
-)
+# PyMuPDF import name is "fitz".
+safe_collect_package("fitz")
 
 
 # ============================================================
-# DOCX
+# DOCX / PPTX XML Runtime
 # ============================================================
 
-safe_collect_submodules(
-    "docx"
-)
+safe_collect_package("docx")
+safe_collect_package("pptx")
 
-safe_collect_package(
-    "docx"
-)
-
-
-# ============================================================
-# PPTX
-# ============================================================
-
-safe_collect_submodules(
-    "pptx"
-)
-
-safe_collect_package(
-    "pptx"
-)
+# python-docx and python-pptx rely heavily on lxml.
+safe_collect_package("lxml")
 
 
 # ============================================================
 # XLSX
 # ============================================================
 
-safe_collect_submodules(
-    "openpyxl"
-)
+safe_collect_package("openpyxl")
 
-safe_collect_package(
-    "openpyxl"
-)
+# openpyxl uses et_xmlfile for XML writing.
+safe_collect_package("et_xmlfile")
 
 
 # ============================================================
 # PostgreSQL
 # ============================================================
 
-safe_collect_submodules(
-    "psycopg"
-)
+safe_collect_package("psycopg")
 
-safe_collect_package(
-    "psycopg"
-)
-
-# psycopg[binary] installs the optimized binary implementation.
-safe_collect_package(
-    "psycopg_binary"
-)
+# psycopg[binary] optimized implementation.
+safe_collect_package("psycopg_binary")
 
 
 # ============================================================
 # YAML / Configuration
 # ============================================================
 
-safe_collect_package(
-    "yaml"
-)
+safe_collect_package("yaml")
 
 
 # ============================================================
-# OCR
+# OCR / Image Runtime
 # ============================================================
 #
-# Required for scanned PDF / image OCR functionality.
+# ImageLoader lazily executes:
 #
-# These packages increase EXE size, but collecting them here
-# avoids runtime errors caused by dynamically loaded OCR assets
-# and ONNX Runtime binaries.
+#     from rapidocr import RapidOCR
+#
+# This import is not visible to normal static analysis until the PNG/JPG
+# path is actually used. RapidOCR also depends on native/image packages
+# and model/config resources.
+#
+# collect_all("rapidocr") is important because it captures package data
+# such as packaged model/config resources when present.
 # ============================================================
 
-safe_collect_package(
-    "rapidocr"
-)
+safe_collect_package("rapidocr")
+safe_collect_package("onnxruntime")
 
-safe_collect_package(
-    "onnxruntime"
-)
+# Explicit OCR/image dependencies. These are deliberately collected
+# because OCR stacks frequently import/select them dynamically.
+safe_collect_package("cv2")
+safe_collect_package("shapely")
+safe_collect_package("pyclipper")
+safe_collect_package("omegaconf")
+
+# numpy is a native dependency of ONNX/OpenCV. Its official PyInstaller
+# hook is normally sufficient; the explicit hidden import makes intent
+# clear without force-collecting every numpy test/submodule.
+hiddenimports += [
+    "numpy",
+]
 
 
 # ============================================================
-# Windows COM / Legacy PowerPoint
+# Windows COM / Legacy .PPT
 # ============================================================
 #
-# Used when legacy Microsoft PowerPoint COM automation is
-# available.
+# app/converter/ppt_converter.py lazily imports pythoncom and
+# win32com.client only when a legacy .ppt file is processed.
 #
-# PyInstaller handles most pywin32 components automatically,
-# but explicit hidden imports improve OneFile reliability.
+# Microsoft PowerPoint itself must still be installed on the target PC.
 # ============================================================
 
 hiddenimports += [
     "pythoncom",
     "pywintypes",
     "win32api",
+    "win32timezone",
     "win32com",
     "win32com.client",
     "win32com.client.dynamic",
     "win32com.client.gencache",
+    "win32com.client.makepy",
 ]
 
-
-safe_collect_submodules(
-    "win32com"
-)
+safe_collect_submodules("win32com")
 
 
 # ============================================================
-# Application Configuration
+# Application Configuration Data
 # ============================================================
 
 config_file = (
@@ -310,17 +399,18 @@ config_file = (
     / "config.yaml"
 )
 
-if not config_file.exists():
+if not config_file.is_file():
     raise FileNotFoundError(
-        f"Required configuration file not found: "
-        f"{config_file}"
+        f"Required configuration file not found: {config_file}"
     )
 
+# ConfigLoader looks for:
+#     sys._MEIPASS/config/config.yaml
+#
+# Destination "config" preserves that path inside OneFile extraction.
 datas.append(
     (
-        str(
-            config_file
-        ),
+        str(config_file),
         "config",
     )
 )
@@ -330,56 +420,47 @@ datas.append(
 # Deduplicate
 # ============================================================
 
-hiddenimports = sorted(
-    set(
-        hiddenimports
+hiddenimports = sorted(set(hiddenimports))
+datas = deduplicate_sequence(datas)
+binaries = deduplicate_sequence(binaries)
+
+
+# ============================================================
+# Build-Time Validation
+# ============================================================
+
+# Fail the build early if a dynamically registered pipeline source file
+# has been deleted/renamed but PipelineFactory/spec was not updated.
+for module_name in pipeline_modules:
+    module_file = (
+        project_root
+        / Path(
+            module_name.replace(".", "/") + ".py"
+        )
     )
-)
 
-datas = deduplicate_sequence(
-    datas
-)
-
-binaries = deduplicate_sequence(
-    binaries
-)
+    if not module_file.is_file():
+        raise FileNotFoundError(
+            "Registered pipeline source file is missing: "
+            f"{module_name} -> {module_file}"
+        )
 
 
 # ============================================================
 # Debug Information
 # ============================================================
 
-print(
-    "============================================================"
-)
-
-print(
-    "[PyInstaller] Document Ingestion Platform"
-)
-
-print(
-    f"[PyInstaller] Project root: {project_root}"
-)
-
-print(
-    f"[PyInstaller] Entry script: {entry_script}"
-)
-
-print(
-    f"[PyInstaller] Hidden imports: {len(hiddenimports)}"
-)
-
-print(
-    f"[PyInstaller] Data entries: {len(datas)}"
-)
-
-print(
-    f"[PyInstaller] Binary entries: {len(binaries)}"
-)
-
-print(
-    "============================================================"
-)
+print("============================================================")
+print("[PyInstaller] Document Ingestion Platform")
+print(f"[PyInstaller] Project root: {project_root}")
+print(f"[PyInstaller] Entry script: {entry_script}")
+print(f"[PyInstaller] Hidden imports: {len(hiddenimports)}")
+print(f"[PyInstaller] Data entries: {len(datas)}")
+print(f"[PyInstaller] Binary entries: {len(binaries)}")
+print("[PyInstaller] Pipelines:")
+for module_name in pipeline_modules:
+    print(f"  - {module_name}")
+print("============================================================")
 
 
 # ============================================================
@@ -388,47 +469,52 @@ print(
 
 analysis = Analysis(
     [
-        str(
-            entry_script
-        )
+        str(entry_script),
     ],
 
+    # Critical for top-level imports such as:
+    #     from app.pipeline.pipeline_factory import PipelineFactory
     pathex=[
-        str(
-            project_root
-        )
+        str(project_root),
     ],
 
     binaries=binaries,
-
     datas=datas,
-
     hiddenimports=hiddenimports,
 
     hookspath=[],
-
     hooksconfig={},
-
     runtime_hooks=[],
 
     excludes=[
         # ====================================================
-        # AI / Embedding
+        # AI / Embedding / Vector Client
         # ====================================================
         #
-        # Current desktop EXE does not provide embedding,
-        # vector database or local LLM functionality.
+        # Current DocumentIngestion.exe is the conversion /
+        # JSON / PostgreSQL desktop application.
         #
-
+        # These packages are intentionally not bundled.
+        #
         "torch",
         "transformers",
         "sentence_transformers",
         "qdrant_client",
 
+        # Project modules that depend on the excluded AI/vector
+        # runtime are also intentionally excluded from this EXE.
+        "app.embedding",
+        "app.embedding.embedding_client",
+        "app.embedding.embedding_repository",
+        "app.embedding.embedding_service",
+        "app.embedding.embedding_worker",
+        "app.vector",
+        "app.vector.base",
+        "app.vector.qdrant_store",
+
         # ====================================================
         # Development / Notebook
         # ====================================================
-
         "matplotlib",
         "notebook",
         "jupyter",
@@ -437,12 +523,10 @@ analysis = Analysis(
         # ====================================================
         # Legacy PostgreSQL Driver
         # ====================================================
-
         "psycopg2",
     ],
 
     noarchive=False,
-
     optimize=0,
 )
 
@@ -452,7 +536,7 @@ analysis = Analysis(
 # ============================================================
 
 pyz = PYZ(
-    analysis.pure
+    analysis.pure,
 )
 
 
@@ -462,32 +546,23 @@ pyz = PYZ(
 
 exe = EXE(
     pyz,
-
     analysis.scripts,
-
     analysis.binaries,
-
     analysis.datas,
-
     [],
 
     name="DocumentIngestion",
 
     debug=False,
-
     bootloader_ignore_signals=False,
-
     strip=False,
 
-    # UPX disabled:
-    # more stable for Python native DLLs such as
-    # psycopg / onnxruntime / PyMuPDF.
+    # UPX is intentionally disabled because native packages such as
+    # ONNX Runtime, PyMuPDF, OpenCV and psycopg are more predictable
+    # without binary compression.
     upx=False,
 
-    # ========================================================
-    # Windows GUI
-    # ========================================================
-
+    # Windows GUI application.
     console=False,
 
     # Keep PyInstaller's windowed traceback support.
