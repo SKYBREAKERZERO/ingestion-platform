@@ -168,10 +168,14 @@ hydrate_postgres_password_from_windows_user_env()
 
 
 from app.pipeline.pipeline_factory import PipelineFactory
+from app.config.config_loader import DatabaseConfig
+from app.database.connection import DatabaseConnection
 from app.model.chapter import Chapter
 from app.model.content import Content
 from app.model.document import Document
 from app.model.section import Section
+from app.project.project_registry import ProjectRegistry, ProjectRegistryError
+from app.output.project_output_router import ProjectOutputRouter
 from app.storage.postgres_storage import PostgresStorage
 from app.storage.schema_manager import SchemaManager, RAG_SCHEMA_VERSION
 
@@ -376,6 +380,7 @@ class ProcessingOptions:
     output_directory: Path
     save_json: bool
     save_database: bool
+    project_code: str
 
 
 @dataclass(frozen=True)
@@ -464,6 +469,11 @@ class DocumentIngestionGUI:
         ) = None
 
         self.postgres_connection_verified = False
+
+        # Tracks the currently active processing scope so any scope switch
+        # (21MM / 24MM / Common) invalidates a pending batch selected under
+        # the previous scope.
+        self._last_selected_project_code: str | None = None
 
         self.is_processing = False
 
@@ -582,6 +592,11 @@ class DocumentIngestionGUI:
         self,
     ) -> None:
 
+        self.project_var = tk.StringVar(value="")
+        self.project_target_database_var = tk.StringVar(
+            value="Select a project to determine the target database."
+        )
+
         self.output_directory_var = (
             tk.StringVar(
                 value=str(
@@ -652,6 +667,20 @@ class DocumentIngestionGUI:
             )
         )
 
+        # JSON -> PostgreSQL uses PostgreSQL Settings as the single source of
+        # truth for its target.  These variables are read-only presentation
+        # fields on the import page; there is deliberately no second scope /
+        # database selector there.
+        self.json_import_target_scope_var = tk.StringVar(
+            value="Not selected"
+        )
+        self.json_import_target_database_var = tk.StringVar(
+            value="Not configured"
+        )
+        self.json_import_target_host_var = tk.StringVar(
+            value="Not configured"
+        )
+
         self.json_import_status_var = (
             tk.StringVar(
                 value="Ready"
@@ -710,12 +739,19 @@ class DocumentIngestionGUI:
             )
         )
 
-        self.postgres_database_var = (
-            tk.StringVar(
-                value=postgres_profile[
-                    "database"
-                ]
+        self._project_database_names = dict(
+            postgres_profile.get("project_databases", {})
+        )
+        for definition in ProjectRegistry.PROJECTS.values():
+            self._project_database_names.setdefault(
+                definition.code,
+                definition.database_default,
             )
+
+        # The GUI exposes one Database field.  Its value changes with the
+        # selected processing scope and is remembered independently per scope.
+        self.postgres_database_var = tk.StringVar(
+            value=postgres_profile.get("database", "rag") or "rag"
         )
 
         self.postgres_user_var = (
@@ -1131,6 +1167,41 @@ class DocumentIngestionGUI:
             expand=True,
         )
 
+        project_frame = ttk.Frame(frame)
+        project_frame.pack(fill=X, pady=(0, 12))
+
+        ttk.Label(
+            project_frame,
+            text="Processing Scope (required)",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w", pady=(0, 6))
+
+        self.project_combobox = ttk.Combobox(
+            project_frame,
+            textvariable=self.project_var,
+            values=ProjectRegistry.display_values(),
+            state="readonly",
+            bootstyle="primary",
+        )
+        self.project_combobox.pack(fill=X)
+        self.project_combobox.bind(
+            "<<ComboboxSelected>>",
+            self._on_project_selected,
+        )
+
+        ttk.Label(
+            project_frame,
+            textvariable=self.project_target_database_var,
+            bootstyle="secondary",
+            style="Small.TLabel",
+        ).pack(anchor="w", pady=(5, 0))
+
+        ttk.Separator(
+            frame,
+            orient="horizontal",
+            bootstyle="secondary",
+        ).pack(fill=X, pady=(0, 10))
+
         toolbar = ttk.Frame(
             frame
         )
@@ -1286,6 +1357,91 @@ class DocumentIngestionGUI:
         ).pack(
             side=RIGHT
         )
+
+    def _on_project_selected(self, _event: Any | None = None) -> None:
+        try:
+            project = ProjectRegistry.resolve(self.project_var.get())
+        except ProjectRegistryError:
+            self.project_target_database_var.set(
+                "Select a project to determine the target database."
+            )
+            return
+
+        previous_project_code = getattr(
+            self,
+            "_last_selected_project_code",
+            None,
+        )
+
+        if (
+            previous_project_code
+            and previous_project_code != project.code
+        ):
+            self._clear_pending_files_for_project_switch(
+                previous_project_code=previous_project_code,
+                new_project_code=project.code,
+            )
+
+        self._last_selected_project_code = project.code
+
+        # Processing scope owns a canonical default database name.  Always
+        # auto-fill it when 21MM / 24MM / Common is selected so a stale user
+        # config from an older version cannot accidentally route data to the
+        # wrong database.  The field remains editable after the auto-fill; if
+        # the user deliberately enters another name and saves/tests without
+        # changing scope, that explicit value is still honored.
+        database_name = project.database_default
+        self._project_database_names[project.code] = database_name
+        if self.postgres_database_var.get().strip() != database_name:
+            self.postgres_database_var.set(database_name)
+
+        self.project_target_database_var.set(
+            f"Target PostgreSQL: {database_name or '(not configured)'}"
+        )
+        self._refresh_json_import_target_info()
+        self.postgres_connection_verified = False
+        if hasattr(self, "postgres_create_tables_button"):
+            self.postgres_create_tables_button.configure(state=DISABLED)
+
+    def _clear_pending_files_for_project_switch(
+        self,
+        *,
+        previous_project_code: str,
+        new_project_code: str,
+    ) -> None:
+        """
+        Clear pending document inputs when the user changes project.
+
+        A batch selected under one processing scope must never be silently
+        reused after switching to another scope.  The clear is intentionally automatic
+        and does not show a confirmation dialog.
+        """
+
+        pending_count = len(self.selected_files)
+
+        if pending_count == 0:
+            return
+
+        self.selected_files.clear()
+
+        if hasattr(self, "file_listbox"):
+            self.file_listbox.delete(0, END)
+
+        if hasattr(self, "file_count_var"):
+            self._update_file_count()
+
+        if hasattr(self, "current_file_var"):
+            self.current_file_var.set("No file selected.")
+
+        message = (
+            f"Project changed {previous_project_code} -> {new_project_code}; "
+            f"cleared {pending_count} pending input file(s)."
+        )
+
+        if hasattr(self, "status_var"):
+            self.status_var.set(message)
+
+        LOGGER.info(message)
 
     # ========================================================
     # Output
@@ -1462,7 +1618,9 @@ class DocumentIngestionGUI:
             frame,
             text=(
                 "PostgreSQL password is requested only "
-                "when database output is enabled."
+                "when database output is enabled. "
+                "In JSON-only mode, files are automatically separated into "
+                "output/21MM, output/24MM, or output/COMMON."
             ),
             bootstyle="secondary",
             wraplength=330,
@@ -1959,6 +2117,26 @@ class DocumentIngestionGUI:
             ttk.Entry
         ] = []
 
+        ttk.Label(
+            frame,
+            text="Processing Scope",
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 14), pady=7)
+
+        self.postgres_project_combobox = ttk.Combobox(
+            frame,
+            textvariable=self.project_var,
+            values=ProjectRegistry.display_values(),
+            state="readonly",
+            bootstyle="primary",
+        )
+        self.postgres_project_combobox.grid(
+            row=0, column=1, sticky="ew", pady=7
+        )
+        self.postgres_project_combobox.bind(
+            "<<ComboboxSelected>>", self._on_project_selected
+        )
+
         for row_index, (
             label_text,
             variable,
@@ -1975,7 +2153,7 @@ class DocumentIngestionGUI:
                     "bold",
                 ),
             ).grid(
-                row=row_index,
+                row=row_index + 1,
                 column=0,
                 sticky="w",
                 padx=(
@@ -1992,7 +2170,7 @@ class DocumentIngestionGUI:
             )
 
             entry.grid(
-                row=row_index,
+                row=row_index + 1,
                 column=1,
                 sticky="ew",
                 pady=7,
@@ -2004,7 +2182,7 @@ class DocumentIngestionGUI:
 
         password_row = len(
             fields
-        )
+        ) + 1
 
         ttk.Label(
             frame,
@@ -2430,11 +2608,11 @@ class DocumentIngestionGUI:
 
         instructions = (
             "1. Install / prepare PostgreSQL or enter a remote DB host.",
-            "2. Enter Host, Port, Database and User.",
-            "3. Enter the PostgreSQL password.",
-            "4. Click Test Connection.",
-            "5. Click Initialize / Upgrade RAG Database.",
-            "6. Click Save Settings.",
+            "2. Select 21MM, 24MM, or Common.",
+            "3. Database auto-fills: 21MM=rag_21mm, 24MM=rag_24mm, Common=rag.",
+            "4. Enter the PostgreSQL password.",
+            "5. Click Test Connection, then Initialize / Upgrade RAG Database.",
+            "6. Switch scope and set another database name when physical separation is needed.",
             "7. Use Document Conversion or JSON → PostgreSQL.",
         )
 
@@ -2495,6 +2673,10 @@ class DocumentIngestionGUI:
             "host": "127.0.0.1",
             "port": 5432,
             "database": "rag",
+            "project_databases": {
+                definition.code: definition.database_default
+                for definition in ProjectRegistry.PROJECTS.values()
+            },
             "user": "postgres",
             "connect_timeout": 10,
         }
@@ -2585,6 +2767,11 @@ class DocumentIngestionGUI:
                     )
                 )
 
+                project_databases = database.get(
+                    "project_databases",
+                    {},
+                )
+
                 user = database.get(
                     "user"
                 )
@@ -2637,6 +2824,23 @@ class DocumentIngestionGUI:
                         database_name.strip()
                     )
 
+                if isinstance(project_databases, dict):
+                    for project_code in ProjectRegistry.PROJECTS:
+                        project_database = project_databases.get(project_code)
+                        if isinstance(project_database, str) and project_database.strip():
+                            profile["project_databases"][project_code] = (
+                                project_database.strip()
+                            )
+
+                # Common/generic mode uses database.database as its backwards-
+                # compatible fallback when no explicit COMMON mapping exists.
+                if (
+                    "COMMON" not in project_databases
+                    and isinstance(database_name, str)
+                    and database_name.strip()
+                ):
+                    profile["project_databases"]["COMMON"] = database_name.strip()
+
                 if (
                     isinstance(
                         user,
@@ -2684,11 +2888,20 @@ class DocumentIngestionGUI:
             .strip()
         )
 
-        database = (
-            self.postgres_database_var
-            .get()
-            .strip()
-        )
+        try:
+            project = ProjectRegistry.resolve(self.project_var.get())
+        except ProjectRegistryError:
+            messagebox.showwarning(
+                "PostgreSQL Settings",
+                "Select 21MM, 24MM, or Common first. Connection test and "
+                "schema initialization operate on the selected scope's database.",
+                parent=self.root,
+            )
+            return None
+
+        database = self.postgres_database_var.get().strip()
+        if database:
+            self._project_database_names[project.code] = database
 
         user = (
             self.postgres_user_var
@@ -2874,7 +3087,11 @@ class DocumentIngestionGUI:
                 "enabled": True,
                 "host": settings.host,
                 "port": settings.port,
-                "database": settings.database,
+                "database": "rag",
+                "project_databases": {
+                    code: self._project_database_names.get(code, "rag") or "rag"
+                    for code in ProjectRegistry.PROJECTS
+                },
                 "user": settings.user,
                 "password_env": (
                     "POSTGRES_PASSWORD"
@@ -2960,12 +3177,13 @@ class DocumentIngestionGUI:
             (
                 "PostgreSQL settings saved | "
                 "host=%s | port=%s | "
-                "database=%s | user=%s | "
+                "database=%s | scope_databases=%s | user=%s | "
                 "config=%s"
             ),
             settings.host,
             settings.port,
             settings.database,
+            self._project_database_names,
             settings.user,
             USER_POSTGRES_CONFIG_FILE,
         )
@@ -3007,9 +3225,19 @@ class DocumentIngestionGUI:
             )
         )
 
-        self.postgres_database_var.set(
-            defaults["database"]
-        )
+        self._project_database_names = dict(defaults["project_databases"])
+        try:
+            active_project = ProjectRegistry.resolve(self.project_var.get())
+        except ProjectRegistryError:
+            self.postgres_database_var.set(defaults["database"])
+        else:
+            self.postgres_database_var.set(
+                self._project_database_names.get(
+                    active_project.code,
+                    active_project.database_default,
+                )
+            )
+        self._on_project_selected()
 
         self.postgres_user_var.set(
             defaults["user"]
@@ -3382,6 +3610,23 @@ class DocumentIngestionGUI:
                 bootstyle="secondary"
             )
 
+        # Keep the per-scope database mapping and the Document Conversion
+        # target hint in sync while the single Database field is edited.
+        try:
+            project = ProjectRegistry.resolve(self.project_var.get())
+        except ProjectRegistryError:
+            pass
+        else:
+            database_name = self.postgres_database_var.get().strip()
+            if database_name:
+                self._project_database_names[project.code] = database_name
+            if hasattr(self, "project_target_database_var"):
+                self.project_target_database_var.set(
+                    f"Target PostgreSQL: {database_name or '(not configured)'}"
+                )
+
+        self._refresh_json_import_target_info()
+
     def start_postgres_schema_initialization(
         self,
     ) -> None:
@@ -3411,6 +3656,8 @@ class DocumentIngestionGUI:
         if settings is None:
             return
 
+        project = ProjectRegistry.resolve(self.project_var.get())
+
         password = (
             self.postgres_password_var.get()
             or os.getenv("POSTGRES_PASSWORD")
@@ -3431,6 +3678,10 @@ class DocumentIngestionGUI:
             "Initialize / Upgrade RAG Database",
             (
                 f"Initialize or upgrade PostgreSQL to RAG Schema v{RAG_SCHEMA_VERSION}?\n\n"
+                "Project tables:\n"
+                "  • project_info\n"
+                "  • spec_types\n"
+                "  • spec_subtypes\n\n"
                 "Core tables:\n"
                 "  • documents\n"
                 "  • chapters\n"
@@ -3461,6 +3712,8 @@ class DocumentIngestionGUI:
             kwargs={
                 "settings": settings,
                 "password": password,
+                "project_code": project.code,
+                "project_name": project.display_name,
             },
             daemon=True,
             name="postgres-rag-schema-initializer",
@@ -3472,6 +3725,8 @@ class DocumentIngestionGUI:
         *,
         settings: PostgreSQLSettings,
         password: str,
+        project_code: str,
+        project_name: str,
     ) -> None:
         try:
             manager = SchemaManager(
@@ -3481,6 +3736,8 @@ class DocumentIngestionGUI:
                 user=settings.user,
                 password=password,
                 connect_timeout=settings.connect_timeout,
+                project_code=project_code,
+                project_name=project_name,
             )
             report = manager.ensure_schema()
 
@@ -3554,6 +3811,8 @@ class DocumentIngestionGUI:
                 "PostgreSQL RAG Schema",
                 (
                     f"RAG Schema v{RAG_SCHEMA_VERSION} is ready.\n\n"
+                    "Project tables:\n"
+                    "project_info / spec_types / spec_subtypes\n\n"
                     "Core tables:\n"
                     "documents / chapters / sections / contents / embeddings\n\n"
                     "RAG view: rag_chunks\n"
@@ -4032,12 +4291,43 @@ class DocumentIngestionGUI:
             anchor="w"
         )
 
+        target_grid = ttk.Frame(target_frame)
+        target_grid.pack(fill=X, pady=(8, 0))
+        target_grid.columnconfigure(1, weight=1)
+
+        for row_index, (label_text, variable) in enumerate((
+            ("Scope", self.json_import_target_scope_var),
+            ("Database", self.json_import_target_database_var),
+            ("Host", self.json_import_target_host_var),
+        )):
+            ttk.Label(
+                target_grid,
+                text=f"{label_text}:",
+                font=("Segoe UI", 9, "bold"),
+            ).grid(
+                row=row_index,
+                column=0,
+                sticky="w",
+                padx=(0, 10),
+                pady=2,
+            )
+            ttk.Label(
+                target_grid,
+                textvariable=variable,
+                bootstyle="primary",
+                style="Small.TLabel",
+            ).grid(
+                row=row_index,
+                column=1,
+                sticky="w",
+                pady=2,
+            )
+
         ttk.Label(
             target_frame,
             text=(
-                "Database connection settings are loaded "
-                "from config.yaml. The password is requested "
-                "only when it is not already available."
+                "Target is controlled only by PostgreSQL Settings. "
+                "JSON project_code is validated before any file is imported."
             ),
             wraplength=330,
             justify=LEFT,
@@ -4045,11 +4335,10 @@ class DocumentIngestionGUI:
             style="Small.TLabel",
         ).pack(
             anchor="w",
-            pady=(
-                8,
-                0,
-            ),
+            pady=(8, 0),
         )
+
+        self._refresh_json_import_target_info()
 
         behavior_frame = ttk.LabelFrame(
             parent,
@@ -4084,9 +4373,10 @@ class DocumentIngestionGUI:
         )
 
         for text in (
-            "• Validate the JSON structure",
+            "• Validate the entire selected batch before any write",
+            "• Require JSON scope to match PostgreSQL Settings",
             "• Rebuild the Unified Document Model",
-            "• Reuse the existing PostgresStorage",
+            "• Use the current Settings database as the only target",
             "• Update the same document_id idempotently",
             "• Contents are stored with embedding_status=PENDING",
         ):
@@ -4619,6 +4909,19 @@ class DocumentIngestionGUI:
                 "document_id"
             ] = document_id.strip()
 
+        for field_name in (
+            "project_code",
+            "project_name",
+            "project_assignment_source",
+            "series",
+            "region_scope",
+            "spec_type",
+            "spec_subtype",
+        ):
+            value = document_data.get(field_name)
+            if value is not None:
+                metadata[field_name] = value
+
         chapters_data = payload.get(
             "chapters",
             [],
@@ -4701,6 +5004,138 @@ class DocumentIngestionGUI:
         )
 
     # ========================================================
+    # JSON Import Target / Preflight
+    # ========================================================
+
+    def _refresh_json_import_target_info(self) -> None:
+        """Refresh the read-only target shown on JSON -> PostgreSQL."""
+        if not hasattr(self, "json_import_target_scope_var"):
+            return
+
+        try:
+            project = ProjectRegistry.resolve(self.project_var.get())
+        except (ProjectRegistryError, AttributeError):
+            self.json_import_target_scope_var.set("Not selected")
+            self.json_import_target_database_var.set("Not configured")
+        else:
+            self.json_import_target_scope_var.set(project.display_name)
+            database_name = self.postgres_database_var.get().strip()
+            self.json_import_target_database_var.set(
+                database_name or "Not configured"
+            )
+
+        host = self.postgres_host_var.get().strip() if hasattr(
+            self, "postgres_host_var"
+        ) else ""
+        port = self.postgres_port_var.get().strip() if hasattr(
+            self, "postgres_port_var"
+        ) else ""
+        if host and port:
+            self.json_import_target_host_var.set(f"{host}:{port}")
+        elif host:
+            self.json_import_target_host_var.set(host)
+        else:
+            self.json_import_target_host_var.set("Not configured")
+
+    @staticmethod
+    def _extract_json_project_code(json_path: Path) -> str | None:
+        """Read only project assignment metadata for JSON batch preflight."""
+        try:
+            with json_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid JSON syntax: {exc.msg} "
+                f"(line {exc.lineno}, column {exc.colno})."
+            ) from exc
+        except OSError as exc:
+            raise ValueError(f"Unable to read JSON file: {exc}") from exc
+
+        if not isinstance(payload, dict):
+            raise ValueError("JSON root must be an object.")
+
+        document_data = payload.get("document")
+        if isinstance(document_data, dict):
+            value = document_data.get("project_code")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            value = metadata.get("project_code")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        return None
+
+    def _validate_json_import_scope_preflight(
+        self,
+        *,
+        files: list[Path],
+        target_project_code: str,
+    ) -> list[str]:
+        """Validate the whole selected batch before asking PostgreSQL to write."""
+        target = ProjectRegistry.resolve(target_project_code)
+        problems: list[str] = []
+
+        for json_path in files:
+            try:
+                raw_project_code = self._extract_json_project_code(json_path)
+                if raw_project_code is None:
+                    if target.code == "COMMON":
+                        # Legacy generic JSON from pre-project versions is allowed
+                        # only in Common mode.  The worker assigns COMMON before
+                        # the storage layer sees the document.
+                        continue
+                    raise ValueError(
+                        "project_code is missing; project-aware JSON is required "
+                        f"for target {target.display_name}."
+                    )
+
+                actual = ProjectRegistry.resolve(raw_project_code)
+                if actual.code != target.code:
+                    raise ValueError(
+                        f"JSON scope is {actual.display_name}, but current target "
+                        f"is {target.display_name}."
+                    )
+            except Exception as exc:
+                problems.append(f"{json_path.name}: {exc}")
+
+        return problems
+
+    @staticmethod
+    def _apply_common_legacy_assignment(document: Document) -> None:
+        """Assign legacy project-less JSON to Common, and only to Common."""
+        metadata = document.metadata
+        if metadata.get("project_code"):
+            return
+        metadata["project_code"] = "COMMON"
+        metadata.setdefault("project_name", "Common")
+        metadata.setdefault(
+            "project_assignment_source",
+            "JSON_IMPORT_COMMON_FALLBACK",
+        )
+
+    def _build_json_import_database_config(
+        self,
+        *,
+        settings: PostgreSQLSettings,
+    ) -> DatabaseConfig:
+        """Build an explicit connection config from the current Settings fields."""
+        password_env = "POSTGRES_PASSWORD"
+        return DatabaseConfig(
+            enabled=True,
+            host=settings.host,
+            port=settings.port,
+            database=settings.database,
+            project_databases=dict(self._project_database_names),
+            user=settings.user,
+            password=os.getenv(password_env),
+            password_env=password_env,
+            connect_timeout=settings.connect_timeout,
+        )
+
+    # ========================================================
     # JSON Import Start / Worker
     # ========================================================
 
@@ -4714,251 +5149,258 @@ class DocumentIngestionGUI:
         if not self.selected_json_files:
             messagebox.showwarning(
                 "No JSON Files",
-                (
-                    "Please select at least "
-                    "one JSON file."
-                ),
+                "Please select at least one JSON file.",
             )
-
             return
 
         missing_files = [
-            path
-            for path
-            in self.selected_json_files
-            if not path.is_file()
+            path for path in self.selected_json_files if not path.is_file()
         ]
-
         if missing_files:
             messagebox.showerror(
                 "Missing JSON Files",
-                (
-                    "Some selected JSON files "
-                    "no longer exist:\n\n"
-                    + "\n".join(
-                        str(
-                            path
-                        )
-                        for path
-                        in missing_files[:10]
-                    )
-                ),
+                "Some selected JSON files no longer exist:\n\n"
+                + "\n".join(str(path) for path in missing_files[:10]),
             )
+            return
 
+        try:
+            target_project = ProjectRegistry.resolve(self.project_var.get())
+        except ProjectRegistryError:
+            messagebox.showwarning(
+                "JSON Import Target",
+                "Select 21MM, 24MM, or Common in PostgreSQL Settings first.",
+                parent=self.root,
+            )
+            return
+
+        settings = self._collect_postgres_settings()
+        if settings is None:
+            return
+
+        files = list(self.selected_json_files)
+        preflight_problems = self._validate_json_import_scope_preflight(
+            files=files,
+            target_project_code=target_project.code,
+        )
+        if preflight_problems:
+            lines = [
+                "JSON batch validation failed.",
+                "",
+                f"Target scope: {target_project.display_name}",
+                f"Target database: {settings.database}",
+                "",
+                "No files were imported.",
+                "",
+                "Problems:",
+            ]
+            lines.extend(f"- {problem}" for problem in preflight_problems[:10])
+            if len(preflight_problems) > 10:
+                lines.append(f"- ... and {len(preflight_problems) - 10} more")
+            messagebox.showerror(
+                "JSON Import Preflight Failed",
+                "\n".join(lines),
+                parent=self.root,
+            )
             return
 
         if not self._ensure_postgres_password():
             return
 
-        files = list(
-            self.selected_json_files
+        database_config = self._build_json_import_database_config(
+            settings=settings
         )
 
         self.is_processing = True
         self.cancel_requested.clear()
         self.json_import_failures.clear()
-
-        self._set_controls_enabled(
-            False
-        )
-
-        self.cancel_json_import_button.configure(
-            state=NORMAL
-        )
-
-        self.json_import_progress_var.set(
-            0
-        )
-
-        self.json_import_progress_text_var.set(
-            "0%"
-        )
-
-        self.json_import_status_var.set(
-            "Importing"
-        )
-
-        self.json_import_current_file_var.set(
-            "Preparing JSON import..."
-        )
-
+        self._set_controls_enabled(False)
+        self.cancel_json_import_button.configure(state=NORMAL)
+        self.json_import_progress_var.set(0)
+        self.json_import_progress_text_var.set("0%")
+        self.json_import_status_var.set("Importing")
+        self.json_import_current_file_var.set("Validating JSON batch...")
         self.json_import_summary_var.set(
-            (
-                "Success: 0    "
-                "Failed: 0    "
-                f"Total: {len(files)}"
-            )
+            f"Success: 0    Failed: 0    Total: {len(files)}"
         )
-
         self._clear_json_import_log()
 
         LOGGER.info(
-            "JSON import started | "
-            "total=%s",
-            len(
-                files
-            ),
+            "JSON import started | total=%s | target_scope=%s | "
+            "target_database=%s",
+            len(files),
+            target_project.code,
+            settings.database,
         )
 
-        self.json_import_thread = (
-            threading.Thread(
-                target=(
-                    self._import_json_files
-                ),
-                kwargs={
-                    "files": files,
-                },
-                daemon=True,
-                name=(
-                    "json-postgres-import-worker"
-                ),
-            )
+        self.json_import_thread = threading.Thread(
+            target=self._import_json_files,
+            kwargs={
+                "files": files,
+                "target_project_code": target_project.code,
+                "database_config": database_config,
+            },
+            daemon=True,
+            name="json-postgres-import-worker",
         )
-
         self.json_import_thread.start()
 
     def _import_json_files(
         self,
         *,
         files: list[Path],
+        target_project_code: str,
+        database_config: DatabaseConfig,
     ) -> None:
-
-        success_count = 0
-        failed_count = 0
-        total = len(
-            files
-        )
-
+        """Two-phase JSON import: validate the entire batch, then write it."""
+        target_project = ProjectRegistry.resolve(target_project_code)
+        total = len(files)
         cancelled = False
+        validated: list[tuple[Path, Document]] = []
+        validation_failures: list[FileFailure] = []
 
-        # Create the storage after the PostgreSQL password has been
-        # made available to the current process.
-        storage = PostgresStorage()
-
-        for index, json_path in enumerate(
-            files,
-            start=1,
-        ):
-
+        # Phase 1: full JSON/model/scope validation.  No PostgreSQL writes occur
+        # until every selected file passes this phase.
+        for index, json_path in enumerate(files, start=1):
             if self.cancel_requested.is_set():
                 cancelled = True
                 break
 
             self._emit(
                 "json_import_current_file",
-                (
-                    f"{index}/{total} "
-                    f"{json_path.name}"
-                ),
+                f"Validating {index}/{total} {json_path.name}",
             )
-
-            self._emit(
-                "json_import_log",
-                (
-                    "START   | "
-                    f"{json_path.name}"
-                ),
-            )
+            self._emit("json_import_log", f"CHECK   | {json_path.name}")
 
             try:
-                document = (
-                    self._load_document_from_json(
-                        json_path
+                document = self._load_document_from_json(json_path)
+                project_code = document.metadata.get("project_code")
+
+                if not project_code:
+                    if target_project.code != "COMMON":
+                        raise ValueError(
+                            "JSON does not contain document.project_code. "
+                            "Project-aware JSON is required for 21MM / 24MM."
+                        )
+                    self._apply_common_legacy_assignment(document)
+                    project_code = "COMMON"
+                    self._emit(
+                        "json_import_log",
+                        f"LEGACY  | {json_path.name} | assigned to Common",
                     )
+
+                actual_project = ProjectRegistry.resolve(str(project_code))
+                if actual_project.code != target_project.code:
+                    raise ValueError(
+                        f"JSON scope is {actual_project.display_name}, but "
+                        f"current target is {target_project.display_name}."
+                    )
+
+                validated.append((json_path, document))
+
+            except Exception as exc:
+                failure = FileFailure(
+                    file_path=json_path,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                validation_failures.append(failure)
+                self._emit(
+                    "json_import_log",
+                    f"FAILED  | {json_path.name} | "
+                    f"{failure.error_type}: {failure.error_message}",
                 )
 
-                storage.save(
-                    document
-                )
+        if cancelled:
+            self._emit(
+                "json_import_finished",
+                BatchSummary(success=0, failed=0, total=total, cancelled=True),
+            )
+            return
 
+        if validation_failures:
+            self.json_import_failures.extend(validation_failures)
+            self._emit(
+                "json_import_log",
+                "ABORT   | Batch validation failed; no PostgreSQL writes were made.",
+            )
+            self._emit(
+                "json_import_finished",
+                BatchSummary(success=0, failed=total, total=total, cancelled=False),
+            )
+            return
+
+        # Phase 2: all files have a compatible target identity.  Use one
+        # explicit DatabaseConnection built from the current Settings fields,
+        # rather than routing independently from each JSON document.
+        success_count = 0
+        failed_count = 0
+
+        for index, (json_path, document) in enumerate(validated, start=1):
+            if self.cancel_requested.is_set():
+                cancelled = True
+                break
+
+            self._emit(
+                "json_import_current_file",
+                f"{index}/{total} {json_path.name}",
+            )
+            self._emit("json_import_log", f"START   | {json_path.name}")
+
+            try:
+                storage = PostgresStorage(
+                    database_connection=DatabaseConnection(
+                        config=database_config
+                    ),
+                    project_code=target_project.code,
+                )
+                storage.save(document)
                 success_count += 1
 
                 success_message = (
                     "SUCCESS | "
                     f"{json_path.name} | "
-                    f"chapters="
-                    f"{len(document.chapters)} | "
-                    f"sections="
-                    f"{len(document.sections)} | "
-                    f"contents="
-                    f"{len(document.contents)}"
+                    f"scope={target_project.display_name} | "
+                    f"database={database_config.database} | "
+                    f"chapters={len(document.chapters)} | "
+                    f"sections={len(document.sections)} | "
+                    f"contents={len(document.contents)}"
                 )
-
-                self._emit(
-                    "json_import_log",
-                    success_message,
-                )
-
+                self._emit("json_import_log", success_message)
                 LOGGER.info(
-                    "JSON import succeeded | "
-                    "file=%s | "
-                    "chapters=%s | "
-                    "sections=%s | "
-                    "contents=%s",
+                    "JSON import succeeded | file=%s | target_scope=%s | "
+                    "target_database=%s | chapters=%s | sections=%s | contents=%s",
                     json_path,
-                    len(
-                        document.chapters
-                    ),
-                    len(
-                        document.sections
-                    ),
-                    len(
-                        document.contents
-                    ),
+                    target_project.code,
+                    database_config.database,
+                    len(document.chapters),
+                    len(document.sections),
+                    len(document.contents),
                 )
 
             except Exception as exc:
-
                 failed_count += 1
-
                 failure = FileFailure(
                     file_path=json_path,
-                    error_type=(
-                        type(
-                            exc
-                        ).__name__
-                    ),
-                    error_message=str(
-                        exc
-                    ),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
                 )
-
-                self.json_import_failures.append(
-                    failure
-                )
-
+                self.json_import_failures.append(failure)
                 self._emit(
                     "json_import_log",
-                    (
-                        "FAILED  | "
-                        f"{json_path.name} | "
-                        f"{failure.error_type}: "
-                        f"{failure.error_message}"
-                    ),
+                    f"FAILED  | {json_path.name} | "
+                    f"{failure.error_type}: {failure.error_message}",
                 )
-
                 LOGGER.error(
-                    "JSON import failed | "
-                    "file=%s | "
-                    "error_type=%s | "
-                    "error=%s\n%s",
+                    "JSON import failed | file=%s | error_type=%s | error=%s\n%s",
                     json_path,
                     failure.error_type,
                     failure.error_message,
                     traceback.format_exc(),
                 )
 
-            percentage = int(
-                index
-                / total
-                * 100
-            )
-
-            self._emit(
-                "json_import_progress",
-                percentage,
-            )
-
+            percentage = int(index / total * 100)
+            self._emit("json_import_progress", percentage)
             self._emit(
                 "json_import_summary",
                 BatchSummary(
@@ -5780,6 +6222,19 @@ class DocumentIngestionGUI:
 
             return None
 
+        try:
+            selected_project = ProjectRegistry.resolve(
+                self.project_var.get()
+            )
+        except ProjectRegistryError:
+            messagebox.showwarning(
+                "Project Required",
+                "Please select 21MM, 24MM, or Common before processing.",
+            )
+            if hasattr(self, "project_combobox"):
+                self.project_combobox.focus_set()
+            return None
+
         save_json = bool(
             self.save_json_var.get()
         )
@@ -5832,6 +6287,16 @@ class DocumentIngestionGUI:
                 exist_ok=True,
             )
 
+            # JSON-only users may not have PostgreSQL at all. Keep project
+            # outputs physically separated so 21MM / 24MM / Common files
+            # cannot be mixed in a shared output directory.
+            if save_json and not save_database:
+                ProjectOutputRouter.ensure_json_output_directory(
+                    output_directory=output_directory,
+                    project_code=selected_project.code,
+                    save_database=False,
+                )
+
         except OSError as exc:
 
             messagebox.showerror(
@@ -5860,6 +6325,7 @@ class DocumentIngestionGUI:
             save_database=(
                 save_database
             ),
+            project_code=selected_project.code,
         )
 
     # ========================================================
@@ -5900,11 +6366,13 @@ class DocumentIngestionGUI:
                 "total=%s | "
                 "json=%s | "
                 "postgresql=%s | "
+                "project=%s | "
                 "output=%s"
             ),
             len(files),
             options.save_json,
             options.save_database,
+            options.project_code,
             options.output_directory,
         )
 
@@ -6037,16 +6505,15 @@ class DocumentIngestionGUI:
                             options
                             .save_database
                         ),
+                        project_code=options.project_code,
                     )
                 )
 
-                output_path = (
-                    options
-                    .output_directory
-                    / (
-                        f"{file_path.stem}"
-                        ".json"
-                    )
+                output_path = ProjectOutputRouter.resolve_json_output_path(
+                    output_directory=options.output_directory,
+                    project_code=options.project_code,
+                    file_stem=file_path.stem,
+                    save_database=options.save_database,
                 )
 
                 document = (
@@ -6097,6 +6564,7 @@ class DocumentIngestionGUI:
                 success_message = (
                     "SUCCESS | "
                     f"{file_path.name} | "
+                    f"project={options.project_code} | "
                     f"pages={pages} | "
                     f"chapters={chapters} | "
                     f"sections={sections} | "
@@ -6709,6 +7177,15 @@ class DocumentIngestionGUI:
 
             widget.configure(
                 state=state
+            )
+
+        if hasattr(self, "project_combobox"):
+            self.project_combobox.configure(
+                state="readonly" if enabled else DISABLED
+            )
+        if hasattr(self, "postgres_project_combobox"):
+            self.postgres_project_combobox.configure(
+                state="readonly" if enabled else DISABLED
             )
 
         if hasattr(

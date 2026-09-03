@@ -1152,14 +1152,18 @@ Workflow:
 ```text
 Structured JSON
     ↓
-Validate
+Read current Scope / Database from PostgreSQL Settings
+    ↓
+Preflight the whole batch against JSON project_code
     ↓
 Rebuild Document Model
     ↓
-PostgresStorage
+PostgresStorage (fixed to the current Settings database)
     ↓
 RAG Schema v3
 ```
+
+The `JSON → PostgreSQL` page has no second database selector. `PostgreSQL Settings` is the single source of truth: `21MM → rag_21mm`, `24MM → rag_24mm`, and `Common → rag`. If any JSON in the selected batch has a mismatching `project_code`, the whole batch is rejected before database writes. Common mode also accepts legacy generic JSON without `project_code` and assigns it to `COMMON` during import.
 
 ### PostgreSQL Settings
 

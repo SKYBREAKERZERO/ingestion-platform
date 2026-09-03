@@ -415,6 +415,26 @@ datas.append(
     )
 )
 
+taxonomy_file = (
+    project_root
+    / "config"
+    / "specification_taxonomy.yaml"
+)
+
+if not taxonomy_file.is_file():
+    raise FileNotFoundError(
+        f"Required taxonomy file not found: {taxonomy_file}"
+    )
+
+# SpecificationTaxonomyLoader reads the bundled fallback from
+# sys._MEIPASS/config/specification_taxonomy.yaml.
+datas.append(
+    (
+        str(taxonomy_file),
+        "config",
+    )
+)
+
 
 # ============================================================
 # Deduplicate

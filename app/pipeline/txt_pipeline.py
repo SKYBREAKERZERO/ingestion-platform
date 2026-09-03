@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.builder.json_builder import JsonBuilder
+from app.analyzer.specification_classifier import SpecificationClassifier
 from app.filter.common.content_filter import ContentFilter
 from app.loader.txt_loader import TXTLoader
 from app.normalizer.unicode_normalizer import UnicodeNormalizer
@@ -38,6 +39,7 @@ class TXTPipeline:
         chunk_max_length: int = 1000,
         save_json: bool = True,
         save_database: bool = True,
+        project_code: str | None = None,
     ) -> None:
 
         if chunk_max_length <= 0:
@@ -53,6 +55,8 @@ class TXTPipeline:
             save_database
         )
 
+        self.project_code = project_code
+
         self.loader = TXTLoader()
         self.unicode_normalizer = UnicodeNormalizer()
         self.parser = TXTParser()
@@ -63,6 +67,8 @@ class TXTPipeline:
         )
 
         self.content_filter = ContentFilter()
+
+        self.specification_classifier = SpecificationClassifier(project_code=project_code)
 
         self.chunker = Chunker(
             max_length=chunk_max_length
@@ -83,7 +89,7 @@ class TXTPipeline:
         # Lazy DB initialization:
         # no DB object is created when PostgreSQL output is disabled.
         self.storage = (
-            PostgresStorage()
+            PostgresStorage(project_code=self.project_code)
             if self.save_database_enabled
             else None
         )
@@ -126,6 +132,14 @@ class TXTPipeline:
             self.section_hierarchy.process(
                 document
             )
+        )
+
+        # =====================
+        # Specification Classification
+        # =====================
+
+        document = self.specification_classifier.process(
+            document
         )
 
         document = self.content_filter.filter(

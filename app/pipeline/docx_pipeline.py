@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.builder.json_builder import JsonBuilder
+from app.analyzer.specification_classifier import SpecificationClassifier
 
 from app.filter.common.content_filter import ContentFilter
 from app.filter.docx.paragraph_filter import ParagraphFilter
@@ -56,6 +57,7 @@ class DOCXPipeline:
         chunk_max_length: int = 1000,
         save_json: bool = True,
         save_database: bool = True,
+        project_code: str | None = None,
     ) -> None:
 
         if chunk_max_length <= 0:
@@ -70,6 +72,8 @@ class DOCXPipeline:
         self.save_database_enabled = bool(
             save_database
         )
+
+        self.project_code = project_code
 
         # =====================
         # Loader
@@ -126,6 +130,8 @@ class DOCXPipeline:
         self.section_hierarchy = (
             SectionHierarchyBuilder()
         )
+
+        self.specification_classifier = SpecificationClassifier(project_code=project_code)
 
         self.chunker = Chunker(
             max_length=chunk_max_length
@@ -250,6 +256,14 @@ class DOCXPipeline:
             self.section_hierarchy.process(
                 document
             )
+        )
+
+        # =====================
+        # Specification Classification
+        # =====================
+
+        document = self.specification_classifier.process(
+            document
         )
 
         # =====================
@@ -378,7 +392,7 @@ class DOCXPipeline:
 
         if self.storage is None:
             self.storage = (
-                PostgresStorage()
+                PostgresStorage(project_code=self.project_code)
             )
 
         return self.storage

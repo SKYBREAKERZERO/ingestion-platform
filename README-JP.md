@@ -1148,14 +1148,18 @@ PostgreSQL Settings
 ```text
 Structured JSON
     ↓
-Validate
+PostgreSQL Settings の現在の Scope / Database を取得
+    ↓
+JSON project_code をバッチ全体で事前検証
     ↓
 Document Model 再構築
     ↓
-PostgresStorage
+PostgresStorage（現在の Settings Database に固定）
     ↓
 RAG Schema v3
 ```
+
+`JSON → PostgreSQL` 画面には別の Database 選択を置きません。`PostgreSQL Settings` を唯一のターゲット設定とし、`21MM → rag_21mm`、`24MM → rag_24mm`、`Common → rag` を使用します。選択した JSON のどれか一つでも `project_code` が現在の Scope と一致しない場合、DB 書き込み前にバッチ全体を拒否します。Common は旧版の `project_code` がない汎用 JSON も受け入れ、Import 時に `COMMON` を付与します。
 
 ### PostgreSQL Settings
 

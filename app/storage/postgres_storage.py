@@ -6,6 +6,8 @@ from typing import Any
 
 from app.database.connection import DatabaseConnection
 from app.model.document import Document
+from app.project.project_registry import ProjectRegistry
+from app.storage.project_database_router import ProjectDatabaseRouter
 
 
 class PostgresStorageError(RuntimeError):
@@ -41,17 +43,37 @@ class PostgresStorage:
     def __init__(
         self,
         database_connection: DatabaseConnection | None = None,
+        *,
+        project_code: str | None = None,
     ) -> None:
-        self.db = database_connection or DatabaseConnection()
+        self.project = (
+            ProjectRegistry.resolve(project_code)
+            if project_code is not None
+            else None
+        )
+
+        if database_connection is not None:
+            self.db = database_connection
+        elif self.project is not None:
+            _project, self.db = ProjectDatabaseRouter.create_connection(
+                self.project.code
+            )
+        else:
+            # Backward-compatible fallback for non-project-aware callers.
+            # Production ingestion/JSON import now passes an explicit project.
+            self.db = DatabaseConnection()
 
     def save(self, document: Document) -> bool:
         self._validate_document(document)
+        self._validate_project_assignment(document)
         document_id = self._resolve_document_id(document)
 
         try:
             with self.db.connect() as conn:
                 try:
                     with conn.cursor() as cur:
+                        self._verify_project_database(cur)
+
                         self._save_document(
                             cur=cur,
                             document=document,
@@ -122,6 +144,65 @@ class PostgresStorage:
         return True
 
     # ==================================================
+    # Project Guard
+    # ==================================================
+
+    def _validate_project_assignment(self, document: Document) -> None:
+        if self.project is None:
+            return
+
+        metadata = dict(getattr(document, "metadata", None) or {})
+        assigned = metadata.get("project_code")
+        if assigned is None:
+            raise PostgresStorageError(
+                "Document project_code is missing. Select 21MM, 24MM, or Common "
+                "in the GUI before processing."
+            )
+
+        actual = ProjectRegistry.resolve(str(assigned))
+        if actual.code != self.project.code:
+            raise PostgresStorageError(
+                "Project/database routing mismatch: document is assigned to "
+                f"{actual.display_name}, but storage targets "
+                f"{self.project.display_name}."
+            )
+
+    def _verify_project_database(self, cur: Any) -> None:
+        if self.project is None:
+            return
+
+        cur.execute("SELECT to_regclass('public.project_info')")
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            raise PostgresStorageError(
+                "project_info table is missing. Initialize/upgrade the selected "
+                "project database before importing documents."
+            )
+
+        cur.execute(
+            """
+            SELECT project_code, project_name
+            FROM public.project_info
+            ORDER BY created_at ASC
+            LIMIT 1
+            """
+        )
+        identity = cur.fetchone()
+        if not identity:
+            raise PostgresStorageError(
+                "project_info is empty. Initialize/upgrade the selected project "
+                "database before importing documents."
+            )
+
+        database_project = ProjectRegistry.resolve(str(identity[0]))
+        if database_project.code != self.project.code:
+            raise PostgresStorageError(
+                "Project database identity mismatch: selected project is "
+                f"{self.project.display_name}, but the target database is bound "
+                f"to {database_project.display_name}."
+            )
+
+    # ==================================================
     # Document
     # ==================================================
 
@@ -163,6 +244,13 @@ class PostgresStorage:
                 version,
                 company,
                 category,
+                project_code,
+                project_name,
+                project_assignment_source,
+                series,
+                region_scope,
+                spec_type,
+                spec_subtype,
                 source_file,
                 language,
                 source_hash,
@@ -172,7 +260,8 @@ class PostgresStorage:
             VALUES
             (
                 %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, CAST(%s AS jsonb), %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                CAST(%s AS jsonb), %s,
                 CAST(%s AS jsonb), NOW()
             )
             ON CONFLICT (document_id)
@@ -185,6 +274,13 @@ class PostgresStorage:
                 version = EXCLUDED.version,
                 company = EXCLUDED.company,
                 category = EXCLUDED.category,
+                project_code = EXCLUDED.project_code,
+                project_name = EXCLUDED.project_name,
+                project_assignment_source = EXCLUDED.project_assignment_source,
+                series = EXCLUDED.series,
+                region_scope = EXCLUDED.region_scope,
+                spec_type = EXCLUDED.spec_type,
+                spec_subtype = EXCLUDED.spec_subtype,
                 source_file = EXCLUDED.source_file,
                 language = EXCLUDED.language,
                 source_hash = EXCLUDED.source_hash,
@@ -201,6 +297,13 @@ class PostgresStorage:
                 metadata.get("version"),
                 metadata.get("company"),
                 metadata.get("category"),
+                metadata.get("project_code"),
+                metadata.get("project_name"),
+                metadata.get("project_assignment_source"),
+                metadata.get("series"),
+                metadata.get("region_scope"),
+                metadata.get("spec_type"),
+                metadata.get("spec_subtype"),
                 metadata.get("source_file") or file_name,
                 language_json,
                 str(source_hash) if source_hash is not None else None,

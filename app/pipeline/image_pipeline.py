@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.builder.json_builder import JsonBuilder
+from app.analyzer.specification_classifier import SpecificationClassifier
 from app.filter.common.content_filter import ContentFilter
 from app.loader.image_loader import ImageLoader
 from app.normalizer.unicode_normalizer import UnicodeNormalizer
@@ -44,6 +45,7 @@ class ImagePipeline:
         chunk_max_length: int = 1000,
         save_json: bool = True,
         save_database: bool = True,
+        project_code: str | None = None,
         ocr_minimum_score: float = 0.50,
     ) -> None:
 
@@ -60,6 +62,8 @@ class ImagePipeline:
             save_database
         )
 
+        self.project_code = project_code
+
         self.loader = ImageLoader(
             minimum_score=(
                 ocr_minimum_score
@@ -75,6 +79,8 @@ class ImagePipeline:
         )
 
         self.content_filter = ContentFilter()
+
+        self.specification_classifier = SpecificationClassifier(project_code=project_code)
 
         self.chunker = Chunker(
             max_length=chunk_max_length
@@ -93,7 +99,7 @@ class ImagePipeline:
         )
 
         self.storage = (
-            PostgresStorage()
+            PostgresStorage(project_code=self.project_code)
             if self.save_database_enabled
             else None
         )
@@ -136,6 +142,14 @@ class ImagePipeline:
             self.section_hierarchy.process(
                 document
             )
+        )
+
+        # =====================
+        # Specification Classification
+        # =====================
+
+        document = self.specification_classifier.process(
+            document
         )
 
         document = self.content_filter.filter(

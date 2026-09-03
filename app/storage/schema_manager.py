@@ -7,9 +7,13 @@ from typing import Any, Iterator, Sequence
 import psycopg
 from psycopg import sql
 
+from app.analyzer.specification_taxonomy import SpecificationTaxonomyLoader
+
 
 RAG_SCHEMA_VERSION = 3
 RAG_SCHEMA_NAME = "rag-schema-v3"
+PROJECT_SCHEMA_VERSION = 3
+PROJECT_SCHEMA_NAME = "project-routing-taxonomy-v1"
 
 
 class SchemaManagerError(RuntimeError):
@@ -77,6 +81,27 @@ class SchemaManager:
     """
 
     REQUIRED_TABLE_COLUMNS: dict[str, set[str]] = {
+        "project_info": {
+            "project_code",
+            "project_name",
+            "created_at",
+            "updated_at",
+        },
+        "spec_types": {
+            "code",
+            "display_name",
+            "enabled",
+            "created_at",
+            "updated_at",
+        },
+        "spec_subtypes": {
+            "code",
+            "spec_type_code",
+            "display_name",
+            "enabled",
+            "created_at",
+            "updated_at",
+        },
         "documents": {
             "id",
             "document_id",
@@ -84,6 +109,13 @@ class SchemaManager:
             "file_type",
             "title",
             "module",
+            "project_code",
+            "project_name",
+            "project_assignment_source",
+            "series",
+            "region_scope",
+            "spec_type",
+            "spec_subtype",
             "metadata",
             "created_at",
             "updated_at",
@@ -178,6 +210,8 @@ class SchemaManager:
         password: str | None = None,
         connect_timeout: int = 10,
         database_connection: Any | None = None,
+        project_code: str | None = None,
+        project_name: str | None = None,
     ) -> None:
         self.database_connection = database_connection
         self.host = str(host or "").strip()
@@ -186,6 +220,8 @@ class SchemaManager:
         self.user = str(user or "").strip()
         self.password = password
         self.connect_timeout = int(connect_timeout)
+        self.project_code = str(project_code or "").strip() or None
+        self.project_name = str(project_name or "").strip() or None
 
         if self.database_connection is None:
             missing = [
@@ -232,6 +268,8 @@ class SchemaManager:
             with self._connect() as connection:
                 with connection.cursor() as cursor:
                     self._create_base_tables(cursor, created)
+                    self._seed_spec_types(cursor)
+                    self._seed_spec_subtypes(cursor)
                     self._upgrade_columns(cursor, created)
                     self._backfill_compatibility_columns(cursor)
                     self._backfill_content_chapter(cursor)
@@ -242,6 +280,7 @@ class SchemaManager:
                         warnings=warnings,
                     )
                     self._create_rag_view(cursor, created)
+                    self._record_project_identity(cursor)
                     self._record_schema_version(cursor)
                 connection.commit()
         except Exception as exc:
@@ -373,6 +412,46 @@ class SchemaManager:
                 """,
             ),
             (
+                "project_info",
+                """
+                CREATE TABLE IF NOT EXISTS public.project_info (
+                    project_code TEXT PRIMARY KEY,
+                    project_name TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+            ),
+            (
+                "spec_types",
+                """
+                CREATE TABLE IF NOT EXISTS public.spec_types (
+                    code TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+            ),
+            (
+                "spec_subtypes",
+                """
+                CREATE TABLE IF NOT EXISTS public.spec_subtypes (
+                    code TEXT PRIMARY KEY,
+                    spec_type_code TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT fk_spec_subtypes_type
+                        FOREIGN KEY (spec_type_code)
+                        REFERENCES public.spec_types(code)
+                        ON DELETE RESTRICT
+                )
+                """,
+            ),
+            (
                 "documents",
                 """
                 CREATE TABLE IF NOT EXISTS public.documents (
@@ -386,6 +465,13 @@ class SchemaManager:
                     version TEXT,
                     company TEXT,
                     category TEXT,
+                    project_code TEXT,
+                    project_name TEXT,
+                    project_assignment_source TEXT,
+                    series TEXT,
+                    region_scope TEXT,
+                    spec_type TEXT,
+                    spec_subtype TEXT,
                     source_file TEXT,
                     language JSONB,
                     source_hash TEXT,
@@ -524,6 +610,46 @@ class SchemaManager:
             if not existed:
                 created.append(f"table:{name}")
 
+    @staticmethod
+    def _seed_spec_types(cursor: Any) -> None:
+        taxonomy = SpecificationTaxonomyLoader.load()
+        for spec_type in taxonomy.spec_types:
+            cursor.execute(
+                """
+                INSERT INTO public.spec_types(
+                    code, display_name, enabled, created_at, updated_at
+                )
+                VALUES (%s, %s, TRUE, NOW(), NOW())
+                ON CONFLICT (code)
+                DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    enabled = TRUE,
+                    updated_at = NOW()
+                """,
+                (spec_type.code, spec_type.display_name),
+            )
+
+    @staticmethod
+    def _seed_spec_subtypes(cursor: Any) -> None:
+        taxonomy = SpecificationTaxonomyLoader.load()
+        for spec_type in taxonomy.spec_types:
+            for subtype in spec_type.subtypes:
+                cursor.execute(
+                    """
+                    INSERT INTO public.spec_subtypes(
+                        code, spec_type_code, display_name, enabled, created_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, TRUE, NOW(), NOW())
+                    ON CONFLICT (code)
+                    DO UPDATE SET
+                        spec_type_code = EXCLUDED.spec_type_code,
+                        display_name = EXCLUDED.display_name,
+                        enabled = TRUE,
+                        updated_at = NOW()
+                    """,
+                    (subtype.code, spec_type.code, subtype.display_name),
+                )
+
     def _upgrade_columns(self, cursor: Any, created: list[str]) -> None:
         upgrades: dict[str, Sequence[tuple[str, str]]] = {
             "documents": (
@@ -535,6 +661,13 @@ class SchemaManager:
                 ("version", "TEXT"),
                 ("company", "TEXT"),
                 ("category", "TEXT"),
+                ("project_code", "TEXT"),
+                ("project_name", "TEXT"),
+                ("project_assignment_source", "TEXT"),
+                ("series", "TEXT"),
+                ("region_scope", "TEXT"),
+                ("spec_type", "TEXT"),
+                ("spec_subtype", "TEXT"),
                 ("source_file", "TEXT"),
                 ("language", "JSONB"),
                 ("source_hash", "TEXT"),
@@ -637,6 +770,30 @@ class SchemaManager:
     ) -> None:
         desired = (
             ("uq_documents_document_id", "documents", ("document_id",), True),
+            (
+                "idx_documents_project_spec_type",
+                "documents",
+                ("project_code", "spec_type"),
+                False,
+            ),
+            (
+                "idx_documents_project_region_spec_type",
+                "documents",
+                ("project_code", "region_scope", "spec_type"),
+                False,
+            ),
+            (
+                "idx_documents_project_spec_subtype",
+                "documents",
+                ("project_code", "spec_type", "spec_subtype"),
+                False,
+            ),
+            (
+                "idx_documents_series_spec_type",
+                "documents",
+                ("series", "spec_type"),
+                False,
+            ),
             (
                 "uq_chapters_document_chapter",
                 "chapters",
@@ -752,6 +909,11 @@ class SchemaManager:
                 c.document_id,
                 COALESCE(NULLIF(d.file_name, ''), d.title, d.document_id) AS file_name,
                 COALESCE(NULLIF(d.file_type, ''), d.module, d.document_type) AS file_type,
+                d.project_code,
+                d.project_name,
+                d.project_assignment_source,
+                d.series,
+                d.spec_type,
                 COALESCE(c.chapter_id, s.chapter_id) AS chapter_id,
                 ch.title_jp AS chapter_title_jp,
                 ch.title_en AS chapter_title_en,
@@ -777,7 +939,11 @@ class SchemaManager:
                 c.embedding_retry_count,
                 c.embedding_error,
                 c.created_at,
-                c.updated_at
+                c.updated_at,
+                -- PostgreSQL CREATE OR REPLACE VIEW requires existing column names/order
+                -- to stay unchanged. New view columns must be appended at the end.
+                d.spec_subtype,
+                d.region_scope
             FROM public.contents c
             LEFT JOIN public.documents d
               ON d.document_id = c.document_id
@@ -791,6 +957,55 @@ class SchemaManager:
         )
         if not existed:
             created.append("view:rag_chunks")
+
+    def _record_project_identity(self, cursor: Any) -> None:
+        if not self.project_code:
+            return
+
+        project_name = self.project_name or self.project_code
+
+        cursor.execute(
+            """
+            SELECT project_code, project_name
+            FROM public.project_info
+            ORDER BY created_at ASC
+            LIMIT 1
+            """
+        )
+        existing = cursor.fetchone()
+        if existing and str(existing[0]) != self.project_code:
+            raise SchemaManagerError(
+                "Target database is already bound to project "
+                f"{existing[1]} ({existing[0]}), not "
+                f"{project_name} ({self.project_code})."
+            )
+
+        cursor.execute(
+            """
+            INSERT INTO public.project_info(
+                project_code, project_name, created_at, updated_at
+            )
+            VALUES (%s, %s, NOW(), NOW())
+            ON CONFLICT (project_code)
+            DO UPDATE SET
+                project_name = EXCLUDED.project_name,
+                updated_at = NOW()
+            """,
+            (self.project_code, project_name),
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO public.schema_version(component, version, name, applied_at)
+            VALUES ('document_ingestion_project', %s, %s, NOW())
+            ON CONFLICT (component)
+            DO UPDATE SET
+                version = EXCLUDED.version,
+                name = EXCLUDED.name,
+                applied_at = EXCLUDED.applied_at
+            """,
+            (PROJECT_SCHEMA_VERSION, PROJECT_SCHEMA_NAME),
+        )
 
     @staticmethod
     def _record_schema_version(cursor: Any) -> None:

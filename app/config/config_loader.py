@@ -67,6 +67,7 @@ class DatabaseConfig:
     host: str
     port: int
     database: str
+    project_databases: dict[str, str]
     user: str
     password: str | None
     password_env: str
@@ -644,6 +645,40 @@ class ConfigLoader:
             password_env
         )
 
+        raw_project_databases = database_data.get(
+            "project_databases",
+            {},
+        )
+        if raw_project_databases is None:
+            raw_project_databases = {}
+        if not isinstance(raw_project_databases, dict):
+            raise ConfigurationValidationError(
+                "database.project_databases must be a mapping."
+            )
+
+        default_database_name = cls._get_string(
+            database_data,
+            "database",
+            default="rag",
+        )
+
+        project_databases = {
+            "21MM": str(
+                raw_project_databases.get("21MM", default_database_name)
+            ).strip(),
+            "24MM": str(
+                raw_project_databases.get("24MM", default_database_name)
+            ).strip(),
+            "COMMON": str(
+                raw_project_databases.get("COMMON", default_database_name)
+            ).strip(),
+        }
+        for project_code, database_name in project_databases.items():
+            if not database_name:
+                raise ConfigurationValidationError(
+                    f"database.project_databases.{project_code} cannot be empty."
+                )
+
         database = DatabaseConfig(
             enabled=cls._get_bool(
                 database_data,
@@ -662,11 +697,8 @@ class ConfigLoader:
                 minimum=1,
                 maximum=65535,
             ),
-            database=cls._get_string(
-                database_data,
-                "database",
-                default="rag",
-            ),
+            database=default_database_name,
+            project_databases=project_databases,
             user=cls._get_string(
                 database_data,
                 "user",

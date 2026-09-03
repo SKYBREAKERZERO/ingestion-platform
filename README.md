@@ -1198,14 +1198,18 @@ PostgreSQL Settings
 ```text
 Existing JSON
     ↓
-Validate JSON
+读取 PostgreSQL Settings 当前 Scope / Database
+    ↓
+整批校验 JSON project_code
     ↓
 Rebuild Document
     ↓
-PostgresStorage
+PostgresStorage（固定写入当前 Settings Database）
     ↓
 RAG Schema v3
 ```
+
+`JSON → PostgreSQL` 页面不再提供第二套数据库选择。目标由 `PostgreSQL Settings` 唯一控制：`21MM → rag_21mm`、`24MM → rag_24mm`、`Common → rag`。如果批量 JSON 中任意文件的 `project_code` 与当前 Scope 不一致，整批在写入前拒绝；Common 模式可兼容旧版没有 `project_code` 的通用 JSON，并在导入时标记为 `COMMON`。
 
 ### PostgreSQL Settings
 
@@ -2275,3 +2279,13 @@ RAG
 
 **PostgreSQL 作为 Source of Truth，Qdrant 作为 Vector Search Index。**  
 通过稳定 Chunk Identity、`content_hash`、Embedding 状态与 `vector_delete_queue`，为后续企业级 RAG 数据一致性和向量生命周期管理提供基础。
+
+
+## Common / Generic Document Mode
+
+The GUI processing-scope selector supports `21MM`, `24MM`, and `Common`.
+
+- `21MM` / `24MM`: specification-document mode with dictionary-driven specification classification.
+- `Common`: general-purpose mode for news, meeting documents, screenshots, reports and other non-specification material. It uses the same parsing/chunking/JSON/PostgreSQL schema but does not assign specification taxonomy fields.
+- PostgreSQL Settings shows one `Database` field. The selected scope remembers its own database name; the default is `rag`.
+- In JSON-only mode, output files are separated into `21MM`, `24MM`, or `COMMON` folders.

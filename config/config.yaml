@@ -15,6 +15,12 @@ database:
   host: "127.0.0.1"
   port: 5432
   database: "rag"
+  # Each processing scope remembers its own database name.  The GUI exposes
+  # only one Database field at a time; new/unconfigured scopes default to rag.
+  project_databases:
+    21MM: "rag"
+    24MM: "rag"
+    COMMON: "rag"
   user: "postgres"
   password_env: "POSTGRES_PASSWORD"
   connect_timeout: 10

@@ -78,6 +78,15 @@ class JsonBuilder:
                 "document_id": document_id,
                 "file_name": document.file_name,
                 "file_type": document.file_type,
+                "project_code": document.metadata.get("project_code"),
+                "project_name": document.metadata.get("project_name"),
+                "project_assignment_source": document.metadata.get(
+                    "project_assignment_source"
+                ),
+                "series": document.metadata.get("series"),
+                "region_scope": document.metadata.get("region_scope"),
+                "spec_type": document.metadata.get("spec_type"),
+                "spec_subtype": document.metadata.get("spec_subtype"),
                 "created_at": datetime.now(
                     timezone.utc
                 ).isoformat(),
@@ -297,6 +306,12 @@ class JsonBuilder:
                         "document_id": document_id,
                         "file_name": document.file_name,
                         "document_type": document.file_type,
+                        "project_code": document.metadata.get("project_code"),
+                        "project_name": document.metadata.get("project_name"),
+                        "series": document.metadata.get("series"),
+                        "region_scope": document.metadata.get("region_scope"),
+                        "spec_type": document.metadata.get("spec_type"),
+                        "spec_subtype": document.metadata.get("spec_subtype"),
                         "chapter_id": chapter_id,
                         "chapter_title": chapter_title,
                         "section_id": section_id,

@@ -33,6 +33,7 @@ class PPTPipeline:
         chunk_max_length: int = 1000,
         save_json: bool = True,
         save_database: bool = True,
+        project_code: str | None = None,
         **pptx_pipeline_options: Any,
     ) -> None:
 
@@ -49,6 +50,8 @@ class PPTPipeline:
             save_database
         )
 
+        self.project_code = project_code
+
         self.converter = PPTConverter()
 
         # Reuse the already-stabilized PPTX processing chain,
@@ -60,6 +63,7 @@ class PPTPipeline:
             ),
             save_json=False,
             save_database=False,
+            project_code=project_code,
             **pptx_pipeline_options,
         )
 
@@ -70,7 +74,7 @@ class PPTPipeline:
         )
 
         self.storage = (
-            PostgresStorage()
+            PostgresStorage(project_code=self.project_code)
             if self.save_database_enabled
             else None
         )
